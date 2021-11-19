@@ -7,3 +7,6 @@ publish = false
 
 [lib]
 doctest = false
+
+[workspace]
+# Don't include this in the overall cargo-mutants workspace, because it fails to build.
