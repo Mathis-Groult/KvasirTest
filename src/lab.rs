@@ -36,6 +36,9 @@ pub fn test_mutants(
     options: &Options,
     console: &Console,
 ) -> Result<LabOutcome> {
+    if options.schemata {
+        return crate::schema_lab::test_mutants(&mutants, workspace, output_dir, options, console);
+    }
     let start_time = Instant::now();
     console.set_debug_log(output_dir.open_debug_log()?);
     if options.shuffle {
@@ -131,7 +134,7 @@ pub fn test_mutants(
 }
 
 #[mutants::skip] // it's a little hard to observe that the threads were collected?
-fn join_threads(threads: Vec<thread::ScopedJoinHandle<'_, Result<()>>>) -> Result<()> {
+pub(crate) fn join_threads(threads: Vec<thread::ScopedJoinHandle<'_, Result<()>>>) -> Result<()> {
     // The errors potentially returned from `join` are a special `std::thread::Result`
     // that does not implement error, indicating that the thread panicked.
     // Probably the most useful thing is to `resume_unwind` it.
@@ -161,12 +164,12 @@ fn join_threads(threads: Vec<thread::ScopedJoinHandle<'_, Result<()>>>) -> Resul
 }
 
 /// Common context across all scenarios, threads, and build dirs.
-struct Lab<'a> {
-    output_mutex: Mutex<OutputDir>,
-    jobserver: Option<jobserver::Client>,
-    tests_for_mutant: TestsForMutant,
-    options: &'a Options,
-    console: &'a Console,
+pub(crate) struct Lab<'a> {
+    pub(crate) output_mutex: Mutex<OutputDir>,
+    pub(crate) jobserver: Option<jobserver::Client>,
+    pub(crate) tests_for_mutant: TestsForMutant,
+    pub(crate) options: &'a Options,
+    pub(crate) console: &'a Console,
 }
 
 impl Lab<'_> {
@@ -176,7 +179,11 @@ impl Lab<'_> {
     /// If it fails, return None, indicating that no further testing should be done.
     ///
     /// If it succeeds, return the timeouts to be used for the other scenarios.
-    fn run_baseline(&self, build_dir: &BuildDir, mutants: &[Mutant]) -> Result<ScenarioOutcome> {
+    pub(crate) fn run_baseline(
+        &self,
+        build_dir: &BuildDir,
+        mutants: &[Mutant],
+    ) -> Result<ScenarioOutcome> {
         let all_mutated_packages: Vec<Arc<Package>> = mutants
             .iter()
             .map(|m| Arc::clone(&m.source_file.package))
@@ -193,7 +200,7 @@ impl Lab<'_> {
     /// Run until the input queue is empty.
     ///
     /// The queue, inside a mutex, can be consumed by multiple threads.
-    fn run_queue(
+    pub(crate) fn run_queue(
         &self,
         build_dir: &BuildDir,
         timeouts: Timeouts,
@@ -202,7 +209,7 @@ impl Lab<'_> {
         self.make_worker(build_dir).run_queue(work_queue, timeouts)
     }
 
-    fn make_worker<'a>(&'a self, build_dir: &'a BuildDir) -> Worker<'a> {
+    pub(crate) fn make_worker<'a>(&'a self, build_dir: &'a BuildDir) -> Worker<'a> {
         Worker {
             build_dir,
             output_mutex: &self.output_mutex,
@@ -218,13 +225,13 @@ impl Lab<'_> {
 ///
 /// It consumes jobs from an input queue and runs them until the queue is empty,
 /// appending output to the output directory.
-struct Worker<'a> {
-    build_dir: &'a BuildDir,
-    output_mutex: &'a Mutex<OutputDir>,
-    jobserver: Option<&'a jobserver::Client>,
-    tests_for_mutant: &'a TestsForMutant,
-    options: &'a Options,
-    console: &'a Console,
+pub(crate) struct Worker<'a> {
+    pub(crate) build_dir: &'a BuildDir,
+    pub(crate) output_mutex: &'a Mutex<OutputDir>,
+    pub(crate) jobserver: Option<&'a jobserver::Client>,
+    pub(crate) tests_for_mutant: &'a TestsForMutant,
+    pub(crate) options: &'a Options,
+    pub(crate) console: &'a Console,
 }
 
 impl Worker<'_> {
@@ -253,7 +260,7 @@ impl Worker<'_> {
         }
     }
 
-    fn run_one_scenario(
+    pub(crate) fn run_one_scenario(
         &mut self,
         scenario: &Scenario,
         test_packages: &PackageSelection,
@@ -292,6 +299,7 @@ impl Worker<'_> {
                 &mut scenario_output,
                 self.options,
                 self.console,
+                &[],
             ) {
                 Ok(phase_result) => {
                     let success = phase_result.is_success(); // so we can move it away
@@ -338,7 +346,7 @@ pub enum TestsForMutant {
 }
 
 impl TestsForMutant {
-    fn new(options: &Options, workspace: &Workspace) -> Self {
+    pub(crate) fn new(options: &Options, workspace: &Workspace) -> Self {
         match options.test_package {
             TestPackages::Workspace => TestsForMutant::Workspace,
             TestPackages::Mutated => TestsForMutant::Mutated,

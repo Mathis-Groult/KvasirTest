@@ -40,6 +40,7 @@ pub fn run_cargo(
     scenario_output: &mut ScenarioOutput,
     options: &Options,
     console: &Console,
+    extra_env: &[(String, String)],
 ) -> Result<PhaseResult> {
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
@@ -55,6 +56,7 @@ pub fn run_cargo(
         debug!(?encoded_rustflags);
         env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), encoded_rustflags));
     }
+    env.extend_from_slice(extra_env);
     let process_status = Process::run(
         &argv,
         &env,
@@ -93,7 +95,11 @@ pub fn cargo_bin() -> String {
 /// Make up the argv for a cargo check/build/test invocation, including argv[0] as the
 /// cargo binary itself.
 // (This is split out so it's easier to test.)
-fn cargo_argv(packages: &PackageSelection, phase: Phase, options: &Options) -> Vec<String> {
+pub(crate) fn cargo_argv(
+    packages: &PackageSelection,
+    phase: Phase,
+    options: &Options,
+) -> Vec<String> {
     let mut cargo_args = vec![cargo_bin()];
     match phase {
         Phase::Test => match &options.test_tool() {

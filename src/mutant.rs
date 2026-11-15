@@ -15,6 +15,7 @@ use tracing::trace;
 use crate::MUTATION_MARKER_COMMENT;
 use crate::build_dir::BuildDir;
 use crate::output::clean_filename;
+use crate::schema::Site;
 use crate::source::SourceFile;
 use crate::span::Span;
 
@@ -88,6 +89,9 @@ pub struct Mutant {
     /// This provides structured information about the mutation target, rather than
     /// encoding it in strings that need to be parsed.
     pub target: Option<MutationTarget>,
+
+    /// The syntax site a schema rewrites to hold this mutant (added by `KvasirTest`).
+    pub site: Site,
 }
 
 /// The function containing a mutant.
@@ -114,6 +118,7 @@ impl Mutant {
     /// This initializes all fields and precomputes the human-readable `name`
     /// (including file path, line/column, and change description) for use in
     /// CLI output, filtering, and JSON.
+    #[allow(clippy::too_many_arguments)] // one per field of the discovered mutant
     pub(crate) fn new_discovered(
         source_file: SourceFile,
         function: Option<Arc<Function>>,
@@ -122,6 +127,7 @@ impl Mutant {
         replacement: String,
         genre: Genre,
         target: Option<MutationTarget>,
+        site: Site,
     ) -> Self {
         let mut mutant = Mutant {
             name: String::new(),
@@ -132,6 +138,7 @@ impl Mutant {
             replacement,
             genre,
             target,
+            site,
         };
         mutant.name = mutant.name(true);
         mutant

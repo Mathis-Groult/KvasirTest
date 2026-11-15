@@ -59,6 +59,12 @@ pub struct Options {
     /// Don't copy at all; run tests in the source directory.
     pub in_place: bool,
 
+    /// Test mutants through one schema build (added by `KvasirTest`).
+    pub schemata: bool,
+
+    /// Mutants run at once in schema mode; None means CPUs minus 2.
+    pub schema_jobs: Option<usize>,
+
     /// Run a jobserver to limit concurrency between child processes.
     pub jobserver: bool,
 
@@ -362,6 +368,8 @@ impl Options {
             copy_target: (!args.no_copy_target)
                 && args.copy_target.or(config.copy_target).unwrap_or(false),
             in_place: args.in_place,
+            schemata: args.schemata,
+            schema_jobs: args.schema_jobs,
             jobs: args.jobs,
             jobserver: args.jobserver,
             jobserver_tasks: args.jobserver_tasks,

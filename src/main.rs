@@ -34,6 +34,8 @@ mod path;
 mod pretty;
 mod process;
 mod scenario;
+mod schema;
+mod schema_lab;
 mod shard;
 mod source;
 mod span;
@@ -266,6 +268,15 @@ pub struct Args {
         help_heading = "Execution"
     )]
     jobs: Option<usize>,
+
+    /// Build all mutants of the run into one schema (each behind a runtime switch) and run them
+    /// in parallel without rebuilding; mutants the schema cannot hold run one build each.
+    #[arg(long, help_heading = "Execution")]
+    schemata: bool,
+
+    /// Run this many mutants at once in schema mode (default: CPUs minus 2, at least 1).
+    #[arg(long, env = "KVASIR_TEST_SCHEMA_JOBS", help_heading = "Execution")]
+    schema_jobs: Option<usize>,
 
     /// Use a GNU Jobserver to cap concurrency between child processes.
     #[arg(long, action = ArgAction::Set, help_heading = "Execution", default_value_t = true)]

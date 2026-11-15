@@ -28,6 +28,7 @@ use crate::fnvalue::return_type_replacements;
 use crate::mutant::{Function, MutationTarget};
 use crate::package::Package;
 use crate::pretty::ToPrettyString;
+use crate::schema::{Site, SiteKind};
 use crate::source::SourceFile;
 use crate::span::Span;
 use crate::{Console, Context, Genre, Mutant, Options, Result, check_interrupted};
@@ -322,6 +323,7 @@ impl DiscoveryVisitor<'_> {
         short_replaced: Option<String>,
         replacement: &TokenStream,
         genre: Genre,
+        site: Site,
     ) {
         let mutant = Mutant::new_discovered(
             self.source_file.clone(),
@@ -331,6 +333,7 @@ impl DiscoveryVisitor<'_> {
             replacement.to_pretty_string(),
             genre,
             None,
+            site,
         );
         if self.options.allows_mutant(&mutant) {
             self.mutants.push(mutant);
@@ -365,7 +368,16 @@ impl DiscoveryVisitor<'_> {
                     if orig_block == new_block {
                         trace!("Replacement is the same as the function body; skipping");
                     } else {
-                        self.collect_mutant(body_span, None, &rep, Genre::FnValue);
+                        self.collect_mutant(
+                            body_span,
+                            None,
+                            &rep,
+                            Genre::FnValue,
+                            Site {
+                                kind: SiteKind::FnBody,
+                                span: body_span,
+                            },
+                        );
                     }
                 }
             }
@@ -616,8 +628,12 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 Vec::new()
             }
         };
+        let site = Site {
+            kind: SiteKind::Expr,
+            span: i.span().into(),
+        };
         for rep in replacements {
-            self.collect_mutant(i.op.span().into(), None, &rep, Genre::BinaryOperator);
+            self.collect_mutant(i.op.span().into(), None, &rep, Genre::BinaryOperator, site);
         }
         syn::visit::visit_expr_binary(self, i);
     }
@@ -630,7 +646,17 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         match i.op {
             UnOp::Not(_) | UnOp::Neg(_) => {
-                self.collect_mutant(i.op.span().into(), None, &quote! {}, Genre::UnaryOperator);
+                let site = Site {
+                    kind: SiteKind::Expr,
+                    span: i.span().into(),
+                };
+                self.collect_mutant(
+                    i.op.span().into(),
+                    None,
+                    &quote! {},
+                    Genre::UnaryOperator,
+                    site,
+                );
             }
             _ => {
                 trace!(
@@ -673,6 +699,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                     Some(arm.pat.to_pretty_string()),
                     &replacement,
                     Genre::MatchArm,
+                    Site {
+                        kind: SiteKind::ArmPattern,
+                        span: arm.pat.span().into(),
+                    },
                 );
             }
         } else {
@@ -683,17 +713,23 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             .iter()
             .flat_map(|arm| &arm.guard)
             .for_each(|(_if, guard_expr)| {
+                let site = Site {
+                    kind: SiteKind::Expr,
+                    span: guard_expr.span().into(),
+                };
                 self.collect_mutant(
                     guard_expr.span().into(),
                     None,
                     &quote! { true },
                     Genre::MatchArmGuard,
+                    site,
                 );
                 self.collect_mutant(
                     guard_expr.span().into(),
                     None,
                     &quote! { false },
                     Genre::MatchArmGuard,
+                    site,
                 );
             });
 
@@ -743,6 +779,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                             field_name: field_name_str,
                             struct_name: struct_name.clone(),
                         }),
+                        Site {
+                            kind: SiteKind::Expr,
+                            span: i.span().into(),
+                        },
                     );
                     self.mutants.push(mutant);
                 }

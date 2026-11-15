@@ -201,6 +201,7 @@ dependencies = [
  "syn",
  "tempfile",
  "test-log",
+ "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",
