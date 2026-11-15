@@ -5,17 +5,19 @@
 //!
 //! 1. Every mutated file is rewritten as a schema holding all its mutants ([`crate::schema`]).
 //! 2. `cargo check` finds mutants the schema cannot hold; they are taken out (and later run the
-//!    classic way) until the schema compiles.
-//! 3. The baseline builds the schema and runs the tests with no mutant active.
-//! 4. Each mutant is a `cargo test` with [`ACTIVE_MUTANT_VAR`] set: nothing is rebuilt, and several
-//!    run at once (cargo holds no lock while test binaries run).
+//!    classic way) until the schema compiles. Const contexts are left out from the start.
+//! 3. The baseline builds the test executables once and runs every test in its own process with
+//!    reach recording on: each test's reach is the set of guards it evaluated.
+//! 4. Each mutant runs only the tests that reach it, directly (no cargo), fastest first, and stops
+//!    at the first failure. A mutant no test reaches is missed without running: a guard that is
+//!    never evaluated cannot change what a test sees.
 //! 5. The original files are restored, then the left-out mutants run one build each.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -26,15 +28,17 @@ use tracing::{debug, error, info, warn};
 use crate::build_dir::BuildDir;
 use crate::cargo::cargo_argv;
 use crate::console::Console;
-use crate::lab::{Lab, TestsForMutant, Worker, join_threads};
+use crate::lab::{Lab, TestsForMutant, join_threads};
 use crate::options::Options;
-use crate::outcome::{LabOutcome, Phase, ScenarioOutcome};
+use crate::outcome::{LabOutcome, Phase, PhaseResult, ScenarioOutcome};
 use crate::output::OutputDir;
 use crate::package::{Package, PackageSelection};
-use crate::schema::{ACTIVE_MUTANT_VAR, SchemaMutant, render};
+use crate::process::Exit;
+use crate::schema::{ACTIVE_MUTANT_VAR, REACH_FILE_VAR, SchemaMutant, parse_reach, render};
+use crate::schema_runner::{TestArgs, Unit, build, list_units};
 use crate::timeouts::Timeouts;
 use crate::workspace::Workspace;
-use crate::{Mutant, Result, Scenario, cargo::run_cargo};
+use crate::{Mutant, Result, Scenario};
 
 /// Like [`crate::lab::test_mutants`], through a schema build.
 pub fn test_mutants(
@@ -62,7 +66,8 @@ pub fn test_mutants(
     };
 
     let prepare_start = Instant::now();
-    let prepared = prepare(&build_dir, mutants, options)?;
+    let compile_time = workspace.compile_time_packages();
+    let prepared = prepare(&build_dir, mutants, &compile_time, options)?;
     info!(
         in_schema = prepared.active.len(),
         left_out = prepared.left_out.len(),
@@ -71,11 +76,13 @@ pub fn test_mutants(
         "schema ready"
     );
 
-    let baseline = lab.run_baseline(&build_dir, mutants)?;
-    if !baseline.success() {
+    let args = TestArgs::parse(&options.additional_cargo_test_args);
+    let packages = test_packages(&lab.tests_for_mutant, workspace, mutants);
+    let n_workers = schema_jobs(options);
+    let baseline_start = Instant::now();
+    let Some(baseline) = run_baseline(&lab, &build_dir, &packages, &args, n_workers)? else {
         error!(
-            "cargo {phase} failed on the schema with no mutant active, so no mutants were tested",
-            phase = baseline.last_phase(),
+            "the schema with no mutant active did not build or pass its tests, so no mutants were tested"
         );
         drop(prepared);
         return lab
@@ -83,22 +90,36 @@ pub fn test_mutants(
             .into_inner()
             .expect("lock output_dir")
             .finish();
-    }
-    let timeouts = Timeouts::from_baseline(&baseline, options);
+    };
+    info!(
+        units = baseline.units.len(),
+        elapsed = ?baseline_start.elapsed(),
+        "baseline and reach recorded"
+    );
     console.start_testing_mutants(mutants.len());
 
-    let n_workers = schema_jobs(options).min(prepared.active.len()).max(1);
+    let mutants_start = Instant::now();
     let queue = Mutex::new(prepared.active.clone().into_iter());
     thread::scope(|scope| -> Result<()> {
-        let workers = (0..n_workers)
+        let workers = (0..n_workers.min(prepared.active.len()).max(1))
             .map(|i| {
-                let worker = lab.make_worker(&build_dir);
-                let queue = &queue;
-                scope.spawn(move || run_schema_queue(&worker, i, queue, timeouts))
+                let (lab, build_dir, queue, baseline, args) =
+                    (&lab, &build_dir, &queue, &baseline, &args);
+                scope.spawn(move || {
+                    let label = build_dir.path().join(format!("[schema worker {i}]"));
+                    loop {
+                        let Some((id, mutant)) = queue.lock().expect("lock schema queue").next()
+                        else {
+                            return Ok(());
+                        };
+                        run_schema_mutant(lab, &label, id, mutant, baseline, args)?;
+                    }
+                })
             })
             .collect_vec();
         join_threads(workers)
     })?;
+    info!(elapsed = ?mutants_start.elapsed(), "schema mutants tested");
 
     let left_out = prepared.restore()?;
     if !left_out.is_empty() {
@@ -106,7 +127,11 @@ pub fn test_mutants(
             count = left_out.len(),
             "testing left-out mutants one build each"
         );
-        lab.run_queue(&build_dir, timeouts, &Mutex::new(left_out.into_iter()))?;
+        lab.run_queue(
+            &build_dir,
+            baseline.timeouts,
+            &Mutex::new(left_out.into_iter()),
+        )?;
     }
 
     let output_dir = lab.output_mutex.into_inner().expect("final unlock");
@@ -124,76 +149,226 @@ fn schema_jobs(options: &Options) -> usize {
     })
 }
 
-fn run_schema_queue(
-    worker: &Worker<'_>,
-    worker_index: usize,
-    queue: &Mutex<std::vec::IntoIter<(u32, Mutant)>>,
-    timeouts: Timeouts,
-) -> Result<()> {
-    // The console tells running scenarios apart by directory: give each worker its own label.
-    let label = worker
-        .build_dir
-        .path()
-        .join(format!("[schema worker {worker_index}]"));
-    loop {
-        let Some((id, mutant)) = queue.lock().expect("lock schema queue").next() else {
-            return Ok(());
-        };
-        run_schema_mutant(worker, &label, id, mutant, timeouts)?;
+/// The packages whose tests the run may use, as the classic mode chooses them.
+fn test_packages(
+    tests_for_mutant: &TestsForMutant,
+    workspace: &Workspace,
+    mutants: &[Mutant],
+) -> Vec<Arc<Package>> {
+    match tests_for_mutant {
+        TestsForMutant::Workspace => workspace.packages().to_vec(),
+        TestsForMutant::Mutated => mutants
+            .iter()
+            .map(|m| Arc::clone(&m.source_file.package))
+            .sorted_by_key(|p| p.name.clone())
+            .dedup_by(|a, b| a.name == b.name)
+            .collect(),
+        TestsForMutant::Explicit(packages) => packages.clone(),
     }
 }
 
-/// Run the tests with one mutant switched on; nothing is rebuilt.
+/// The baseline: every unit, its time with no mutant active, and the mutants it reaches.
+struct Baseline {
+    units: Vec<Unit>,
+    durations: Vec<Duration>,
+    reach: Vec<BTreeSet<u32>>,
+    timeouts: Timeouts,
+}
+
+/// Build the test executables, run every unit once recording its reach; `None` if the build or
+/// any unit failed.
+fn run_baseline(
+    lab: &Lab<'_>,
+    build_dir: &BuildDir,
+    packages: &[Arc<Package>],
+    args: &TestArgs,
+    n_workers: usize,
+) -> Result<Option<Baseline>> {
+    let (options, console) = (lab.options, lab.console);
+    let label = build_dir.path();
+    let (mut output, reach_dir) = {
+        let mut output_dir = lab.output_mutex.lock().expect("lock output_dir");
+        (
+            output_dir.start_scenario(&Scenario::Baseline)?,
+            output_dir.path().join("reach"),
+        )
+    };
+    std::fs::create_dir_all(&reach_dir).context("create reach directory")?;
+    console.scenario_started(label, &Scenario::Baseline, output.open_log_read()?);
+    let mut outcome = ScenarioOutcome::new(&output, Scenario::Baseline);
+
+    console.scenario_phase_started(label, Phase::Build);
+    let (exit, duration, executables) = build(
+        build_dir.path(),
+        packages,
+        args,
+        options,
+        options.build_timeout,
+        &mut output,
+    )?;
+    outcome.add_phase_result(PhaseResult {
+        phase: Phase::Build,
+        duration,
+        process_status: exit,
+        argv: vec!["cargo".into(), "test".into(), "--no-run".into()],
+    });
+    console.scenario_phase_finished(label, Phase::Build);
+    if !exit.is_success() {
+        return finish_baseline(lab, label, &outcome).map(|()| None);
+    }
+
+    console.scenario_phase_started(label, Phase::Test);
+    let units = list_units(&executables, packages, args, build_dir.path())?;
+    output.message(&format!("{} test units", units.len()))?;
+    let results: Mutex<Vec<Option<(Exit, Duration, BTreeSet<u32>)>>> =
+        Mutex::new(vec![None; units.len()]);
+    let queue = Mutex::new(units.iter().enumerate());
+    thread::scope(|scope| -> Result<()> {
+        let workers = (0..n_workers.min(units.len()).max(1))
+            .map(|_| {
+                let (queue, results, reach_dir) = (&queue, &results, &reach_dir);
+                scope.spawn(move || -> Result<()> {
+                    let mut log = lab
+                        .output_mutex
+                        .lock()
+                        .expect("lock output_dir")
+                        .start_scenario(&Scenario::Baseline)?;
+                    loop {
+                        let Some((i, unit)) = queue.lock().expect("lock unit queue").next() else {
+                            return Ok(());
+                        };
+                        let reach_file = reach_dir.join(format!("unit-{i}"));
+                        let env = [(REACH_FILE_VAR.to_owned(), reach_file.to_string())];
+                        let (exit, duration) =
+                            unit.run(args, options, &env, options.test_timeout, &mut log, console)?;
+                        let reach = std::fs::read_to_string(&reach_file)
+                            .map(|t| parse_reach(&t))
+                            .unwrap_or_default();
+                        std::fs::remove_file(&reach_file).ok();
+                        results.lock().expect("lock results")[i] = Some((exit, duration, reach));
+                    }
+                })
+            })
+            .collect_vec();
+        join_threads(workers)
+    })?;
+    let results = results.into_inner().expect("results");
+    let mut status = Exit::Success;
+    let mut durations = Vec::with_capacity(units.len());
+    let mut reach = Vec::with_capacity(units.len());
+    for (unit, result) in units.iter().zip(results) {
+        let (exit, duration, unit_reach) = result.expect("every unit ran");
+        if !exit.is_success() {
+            output.message(&format!("FAILED in baseline: {} ({exit:?})", unit.label()))?;
+            if status.is_success() || exit.is_timeout() {
+                status = exit;
+            }
+        }
+        durations.push(duration);
+        reach.push(unit_reach);
+    }
+    outcome.add_phase_result(PhaseResult {
+        phase: Phase::Test,
+        // The sum, not the wall time: the classic fallback runs its tests in one cargo process.
+        duration: durations.iter().sum(),
+        process_status: status,
+        argv: vec!["kvasir-test".into(), format!("{} units", units.len())],
+    });
+    console.scenario_phase_finished(label, Phase::Test);
+    finish_baseline(lab, label, &outcome)?;
+    if !status.is_success() {
+        return Ok(None);
+    }
+    Ok(Some(Baseline {
+        timeouts: Timeouts::from_baseline(&outcome, options),
+        units,
+        durations,
+        reach,
+    }))
+}
+
+fn finish_baseline(lab: &Lab<'_>, label: &Utf8Path, outcome: &ScenarioOutcome) -> Result<()> {
+    lab.output_mutex
+        .lock()
+        .expect("lock output dir")
+        .add_scenario_outcome(outcome)?;
+    lab.console
+        .scenario_finished(label, &Scenario::Baseline, outcome, lab.options);
+    Ok(())
+}
+
+/// Run the tests that reach one mutant, with it switched on; nothing is rebuilt.
 fn run_schema_mutant(
-    worker: &Worker<'_>,
+    lab: &Lab<'_>,
     label: &Utf8Path,
     id: u32,
     mutant: Mutant,
-    timeouts: Timeouts,
+    baseline: &Baseline,
+    args: &TestArgs,
 ) -> Result<ScenarioOutcome> {
-    let test_packages = match worker.tests_for_mutant {
-        TestsForMutant::Workspace => PackageSelection::All,
-        TestsForMutant::Mutated => {
-            PackageSelection::Explicit(vec![mutant.source_file.package.clone()])
-        }
-        TestsForMutant::Explicit(packages) => PackageSelection::Explicit(packages.clone()),
-    };
+    let (options, console) = (lab.options, lab.console);
+    let mut selected = (0..baseline.units.len())
+        .filter(|&i| baseline.reach[i].contains(&id))
+        .filter(|&i| match lab.tests_for_mutant {
+            TestsForMutant::Mutated => {
+                baseline.units[i].package.name == mutant.source_file.package.name
+            }
+            TestsForMutant::Workspace | TestsForMutant::Explicit(_) => true,
+        })
+        .collect_vec();
+    selected.sort_by_key(|&i| baseline.durations[i]);
+
     let diff = mutant.diff(&mutant.mutated_code());
     let scenario = Scenario::Mutant(mutant);
-    let mut scenario_output = worker
+    let mut output = lab
         .output_mutex
         .lock()
         .expect("lock output_dir to start scenario")
         .start_scenario(&scenario)?;
-    scenario_output.write_diff(&diff)?;
-    scenario_output.message(&format!("schema mutant {id}: {ACTIVE_MUTANT_VAR}={id}"))?;
-    worker
-        .console
-        .scenario_started(label, &scenario, scenario_output.open_log_read()?);
-    let mut outcome = ScenarioOutcome::new(&scenario_output, scenario.clone());
-    worker.console.scenario_phase_started(label, Phase::Test);
-    let phase_result = run_cargo(
-        worker.build_dir,
-        worker.jobserver,
-        &test_packages,
-        Phase::Test,
-        timeouts.test,
-        &mut scenario_output,
-        worker.options,
-        worker.console,
-        &[(ACTIVE_MUTANT_VAR.to_owned(), id.to_string())],
-    )?;
-    outcome.add_phase_result(phase_result);
-    worker.console.scenario_phase_finished(label, Phase::Test);
-    worker
-        .output_mutex
+    output.write_diff(&diff)?;
+    output.message(&format!(
+        "schema mutant {id}: {} of {} tests reach it",
+        selected.len(),
+        baseline.units.len()
+    ))?;
+    console.scenario_started(label, &scenario, output.open_log_read()?);
+    let mut outcome = ScenarioOutcome::new(&output, scenario.clone());
+    console.scenario_phase_started(label, Phase::Test);
+    let env = [(ACTIVE_MUTANT_VAR.to_owned(), id.to_string())];
+    let mut status = Exit::Success;
+    let mut total = Duration::ZERO;
+    for &i in &selected {
+        let timeout = options.test_timeout.unwrap_or_else(|| {
+            options.minimum_test_timeout.max(Duration::from_secs_f64(
+                (baseline.durations[i].as_secs_f64()
+                    * options.test_timeout_multiplier.unwrap_or(5.0))
+                .ceil(),
+            ))
+        });
+        let (exit, duration) =
+            baseline.units[i].run(args, options, &env, Some(timeout), &mut output, console)?;
+        total += duration;
+        if !exit.is_success() {
+            status = exit;
+            break;
+        }
+    }
+    if selected.is_empty() {
+        output.message("no test reaches this mutant: missed without running")?;
+    }
+    outcome.add_phase_result(PhaseResult {
+        phase: Phase::Test,
+        duration: total,
+        process_status: status,
+        argv: vec!["kvasir-test".into(), format!("{} units", selected.len())],
+    });
+    console.scenario_phase_finished(label, Phase::Test);
+    lab.output_mutex
         .lock()
         .expect("lock output dir to add outcome")
         .add_scenario_outcome(&outcome)?;
     debug!(id, outcome = ?outcome.summary());
-    worker
-        .console
-        .scenario_finished(label, &scenario, &outcome, worker.options);
+    console.scenario_finished(label, &scenario, &outcome, options);
     Ok(outcome)
 }
 
@@ -243,6 +418,7 @@ impl Drop for Prepared<'_> {
 fn prepare<'a>(
     build_dir: &'a BuildDir,
     mutants: &[Mutant],
+    compile_time: &BTreeSet<String>,
     options: &Options,
 ) -> Result<Prepared<'a>> {
     let ids: Vec<u32> = (1..=u32::try_from(mutants.len()).context("too many mutants")?).collect();
@@ -270,7 +446,13 @@ fn prepare<'a>(
         rounds: 0,
         restored: false,
     };
-    let mut out: BTreeSet<usize> = BTreeSet::new();
+    // Const contexts and code that runs while compiling are known not to hold a runtime switch:
+    // classic from the start.
+    let mut out: BTreeSet<usize> = (0..mutants.len())
+        .filter(|&i| {
+            mutants[i].site.is_none() || compile_time.contains(&mutants[i].source_file.package.name)
+        })
+        .collect();
     loop {
         prepared.rounds += 1;
         let mut schemas = BTreeMap::new();
@@ -279,11 +461,13 @@ fn prepare<'a>(
             let in_schema = indexes
                 .iter()
                 .filter(|i| !out.contains(i))
-                .map(|&i| SchemaMutant {
-                    id: ids[i],
-                    span: mutants[i].span,
-                    replacement: &mutants[i].replacement,
-                    site: mutants[i].site,
+                .filter_map(|&i| {
+                    Some(SchemaMutant {
+                        id: ids[i],
+                        span: mutants[i].span,
+                        replacement: &mutants[i].replacement,
+                        site: mutants[i].site?,
+                    })
                 })
                 .collect_vec();
             let schema =

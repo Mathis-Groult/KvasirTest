@@ -150,6 +150,7 @@ pub fn walk_file(
         fn_stack: Vec::new(),
         source_file: source_file.clone(),
         options,
+        const_depth: 0,
     };
     visitor.visit_file(&syn_file);
     Ok((visitor.mutants, visitor.external_mods))
@@ -285,6 +286,10 @@ struct DiscoveryVisitor<'o> {
     error_exprs: &'o [Expr],
 
     options: &'o Options,
+
+    /// How many const contexts (const/static items, const fns, array lengths, ...) enclose the
+    /// node being visited. Mutants inside one cannot sit behind a runtime schema switch.
+    const_depth: usize,
 }
 
 impl DiscoveryVisitor<'_> {
@@ -333,7 +338,7 @@ impl DiscoveryVisitor<'_> {
             replacement.to_pretty_string(),
             genre,
             None,
-            site,
+            self.schema_site(site),
         );
         if self.options.allows_mutant(&mutant) {
             self.mutants.push(mutant);
@@ -384,6 +389,18 @@ impl DiscoveryVisitor<'_> {
         } else {
             warn!("collect_fn_mutants called while not in a function?");
         }
+    }
+
+    /// The schema site of a mutant found here: none inside a const context.
+    fn schema_site(&self, site: Site) -> Option<Site> {
+        (self.const_depth == 0).then_some(site)
+    }
+
+    /// Visit `f(self)` inside a const context.
+    fn in_const<F: FnOnce(&mut Self)>(&mut self, f: F) {
+        self.const_depth += 1;
+        f(self);
+        self.const_depth -= 1;
     }
 
     /// Call a function with a namespace pushed onto the stack.
@@ -457,8 +474,11 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             return;
         }
         let function = self.enter_function(&i.sig.ident, &i.sig.output, i.span());
+        let const_fn = usize::from(i.sig.constness.is_some());
+        self.const_depth += const_fn;
         self.collect_fn_mutants(&i.sig, &i.block);
         syn::visit::visit_item_fn(self, i);
+        self.const_depth -= const_fn;
         self.leave_function(function);
     }
 
@@ -481,8 +501,11 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             return;
         }
         let function = self.enter_function(&i.sig.ident, &i.sig.output, i.span());
+        let const_fn = usize::from(i.sig.constness.is_some());
+        self.const_depth += const_fn;
         self.collect_fn_mutants(&i.sig, &i.block);
         syn::visit::visit_impl_item_fn(self, i);
+        self.const_depth -= const_fn;
         self.leave_function(function);
     }
 
@@ -503,8 +526,11 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 return;
             }
             let function = self.enter_function(&i.sig.ident, &i.sig.output, i.span());
+            let const_fn = usize::from(i.sig.constness.is_some());
+            self.const_depth += const_fn;
             self.collect_fn_mutants(&i.sig, block);
             syn::visit::visit_trait_item_fn(self, i);
+            self.const_depth -= const_fn;
             self.leave_function(function);
         }
     }
@@ -578,6 +604,55 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         self.in_namespace(&mod_namespace.name, |v| syn::visit::visit_item_mod(v, node));
         assert_eq!(self.mod_namespace_stack.pop(), Some(mod_namespace));
+    }
+
+    /// `const X: T = ..;` (also inside impls and traits): a const context.
+    fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
+        self.in_const(|v| syn::visit::visit_item_const(v, i));
+    }
+
+    fn visit_impl_item_const(&mut self, i: &'ast syn::ImplItemConst) {
+        self.in_const(|v| syn::visit::visit_impl_item_const(v, i));
+    }
+
+    fn visit_trait_item_const(&mut self, i: &'ast syn::TraitItemConst) {
+        self.in_const(|v| syn::visit::visit_trait_item_const(v, i));
+    }
+
+    /// `static X: T = ..;`: its initialiser is evaluated at compile time.
+    fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
+        self.in_const(|v| syn::visit::visit_item_static(v, i));
+    }
+
+    /// `const { .. }` blocks.
+    fn visit_expr_const(&mut self, i: &'ast syn::ExprConst) {
+        self.in_const(|v| syn::visit::visit_expr_const(v, i));
+    }
+
+    /// `[T; N]`: the length is a const context.
+    fn visit_type_array(&mut self, i: &'ast syn::TypeArray) {
+        self.visit_type(&i.elem);
+        self.in_const(|v| v.visit_expr(&i.len));
+    }
+
+    /// `[x; N]`: the value runs at run time, the length is a const context.
+    fn visit_expr_repeat(&mut self, i: &'ast syn::ExprRepeat) {
+        self.visit_expr(&i.expr);
+        self.in_const(|v| v.visit_expr(&i.len));
+    }
+
+    /// `Variant = discriminant` in an enum.
+    fn visit_variant(&mut self, i: &'ast syn::Variant) {
+        self.in_const(|v| syn::visit::visit_variant(v, i));
+    }
+
+    /// `f::<{ N + 1 }>()`: const generic arguments.
+    fn visit_generic_argument(&mut self, i: &'ast syn::GenericArgument) {
+        if matches!(i, syn::GenericArgument::Const(_)) {
+            self.in_const(|v| syn::visit::visit_generic_argument(v, i));
+        } else {
+            syn::visit::visit_generic_argument(self, i);
+        }
     }
 
     /// Visit `a op b` expressions.
@@ -779,10 +854,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                             field_name: field_name_str,
                             struct_name: struct_name.clone(),
                         }),
-                        Site {
+                        self.schema_site(Site {
                             kind: SiteKind::Expr,
                             span: i.span().into(),
-                        },
+                        }),
                     );
                     self.mutants.push(mutant);
                 }
@@ -1180,6 +1255,38 @@ mod test {
             mutants.iter().map(|m| m.name(false)).collect_vec(),
             ["src/main.rs: replace always_true -> bool with false"]
         );
+    }
+
+    #[test]
+    fn const_contexts_have_no_schema_site() {
+        let code = indoc! { r"
+            const A: u32 = 1 + 2;
+            static B: u32 = 3 * 4;
+            const fn c(x: u32) -> u32 { x + 1 }
+            enum E { V = 5 - 1 }
+            fn d(x: u32) -> u32 {
+                let a = [0u8; 2 + 2];
+                let _ = [x; 3 * 1];
+                g::<{ 1 + 1 }>();
+                x - a.len() as u32
+            }
+        " };
+        let mutants = mutate_source_str(code, &Options::default()).unwrap();
+        let with_site: Vec<String> = mutants
+            .iter()
+            .filter(|m| m.site.is_some())
+            .map(|m| m.name(true))
+            .collect();
+        assert_eq!(
+            with_site,
+            [
+                "src/main.rs:6:5: replace d -> u32 with 0",
+                "src/main.rs:6:5: replace d -> u32 with 1",
+                "src/main.rs:9:7: replace - with + in d",
+                "src/main.rs:9:7: replace - with / in d",
+            ]
+        );
+        assert!(mutants.iter().any(|m| m.site.is_none()));
     }
 
     #[test]

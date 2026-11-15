@@ -90,8 +90,9 @@ pub struct Mutant {
     /// encoding it in strings that need to be parsed.
     pub target: Option<MutationTarget>,
 
-    /// The syntax site a schema rewrites to hold this mutant (added by `KvasirTest`).
-    pub site: Site,
+    /// The syntax site a schema rewrites to hold this mutant (added by `KvasirTest`); `None` in
+    /// const contexts, where a runtime switch cannot compile.
+    pub site: Option<Site>,
 }
 
 /// The function containing a mutant.
@@ -127,7 +128,7 @@ impl Mutant {
         replacement: String,
         genre: Genre,
         target: Option<MutationTarget>,
-        site: Site,
+        site: Option<Site>,
     ) -> Self {
         let mut mutant = Mutant {
             name: String::new(),

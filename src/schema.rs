@@ -16,6 +16,13 @@ use crate::span::{LineColumn, Span};
 /// Environment variable naming the active mutant (`0` or absent: none).
 pub const ACTIVE_MUTANT_VAR: &str = "KVASIR_TEST_MUTANT";
 
+/// Environment variable naming a file: when set, no mutant is active and every guard appends its
+/// id to that file the first time it is evaluated in the process (the reach of a test).
+pub const REACH_FILE_VAR: &str = "KVASIR_TEST_REACH";
+
+/// The value guards hold in reach-recording mode (no mutant has this id).
+const RECORDING: u32 = u32::MAX;
+
 /// Where a mutant sits in the syntax tree, which decides how the schema switches it on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub enum SiteKind {
@@ -98,13 +105,28 @@ pub enum SchemaError {
 
 /// The guard expression that is true only when mutant `id` is active.
 ///
-/// Self-contained (its own `static`), so it works in any module of any crate without a helper item.
+/// Self-contained (its own `static`s), so it works in any module of any crate without a helper
+/// item, and written for every edition (no let-chains). In recording mode ([`REACH_FILE_VAR`]) it is false and reports its id once per process:
+/// a test that never evaluates a guard cannot observe that mutant, which makes the reach exact.
 pub fn guard(id: u32) -> String {
     format!(
         "({{ static KVASIR_TEST_ACTIVE: ::std::sync::OnceLock<u32> = ::std::sync::OnceLock::new(); \
-         *KVASIR_TEST_ACTIVE.get_or_init(|| ::std::env::var(\"{ACTIVE_MUTANT_VAR}\").ok()\
-         .and_then(|v| v.parse().ok()).unwrap_or(0)) }} == {id})"
+         static KVASIR_TEST_SEEN: ::std::sync::atomic::AtomicBool = \
+         ::std::sync::atomic::AtomicBool::new(false); \
+         let active = *KVASIR_TEST_ACTIVE.get_or_init(|| \
+         if ::std::env::var_os(\"{REACH_FILE_VAR}\").is_some() {{ {RECORDING} }} \
+         else {{ ::std::env::var(\"{ACTIVE_MUTANT_VAR}\").ok().and_then(|v| v.parse().ok()).unwrap_or(0) }}); \
+         if active == {RECORDING} && !KVASIR_TEST_SEEN.swap(true, ::std::sync::atomic::Ordering::Relaxed) {{ \
+         if let Some(path) = ::std::env::var_os(\"{REACH_FILE_VAR}\") {{ \
+         if let Ok(mut file) = ::std::fs::OpenOptions::new().create(true).append(true).open(path) {{ \
+         let _ = ::std::io::Write::write_all(&mut file, b\"{id}\\n\"); }} }} }} \
+         active == {id} }})"
     )
+}
+
+/// Mutant ids in a reach file written by guards (one per line; unparsable lines are ignored).
+pub fn parse_reach(text: &str) -> std::collections::BTreeSet<u32> {
+    text.lines().filter_map(|l| l.trim().parse().ok()).collect()
 }
 
 /// Render the schema of `code` holding all `mutants`.
@@ -572,6 +594,14 @@ mod test {
         assert_eq!(
             readable(&schema, &[1]),
             "fn é() -> u32 {\r\n    (if G1 { 1 - 2 } else { 1 + 2 })\r\n}\r\n"
+        );
+    }
+
+    #[test]
+    fn reach_file_lines_are_ids() {
+        assert_eq!(
+            parse_reach("3\n17\n3\ngarbage\n\n"),
+            [3, 17].into_iter().collect()
         );
     }
 

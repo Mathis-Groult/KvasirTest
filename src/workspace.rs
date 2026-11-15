@@ -112,6 +112,36 @@ impl Workspace {
         Ok(Workspace { metadata, packages })
     }
 
+    /// All packages of the workspace.
+    pub fn packages(&self) -> &[Arc<Package>] {
+        &self.packages
+    }
+
+    /// Names of workspace packages whose code runs while other crates compile: proc-macro crates
+    /// and build-dependencies of a workspace package (`KvasirTest`: a runtime schema switch never
+    /// fires there, so their mutants need one build each).
+    pub fn compile_time_packages(&self) -> std::collections::BTreeSet<String> {
+        let members: std::collections::BTreeSet<&str> =
+            self.packages.iter().map(|p| p.name.as_str()).collect();
+        let proc_macros = self.metadata.workspace_packages().into_iter().filter(|p| {
+            p.targets
+                .iter()
+                .any(|t| t.kind.contains(&cargo_metadata::TargetKind::ProcMacro))
+        });
+        let build_deps = self
+            .metadata
+            .workspace_packages()
+            .into_iter()
+            .flat_map(|p| &p.dependencies)
+            .filter(|d| d.kind == cargo_metadata::DependencyKind::Build)
+            .map(|d| d.name.as_str())
+            .filter(|name| members.contains(name));
+        proc_macros
+            .map(|p| p.name.to_string())
+            .chain(build_deps.map(str::to_owned))
+            .collect()
+    }
+
     pub fn packages_by_name<S: AsRef<str>>(&self, names: &[S]) -> Vec<Arc<Package>> {
         names
             .iter()

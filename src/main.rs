@@ -36,6 +36,7 @@ mod process;
 mod scenario;
 mod schema;
 mod schema_lab;
+mod schema_runner;
 mod shard;
 mod source;
 mod span;
