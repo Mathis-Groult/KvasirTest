@@ -18,6 +18,7 @@ mod config;
 mod console;
 mod copy_tree;
 mod custom;
+mod excerpt;
 mod exit_code;
 mod extra;
 mod fnvalue;

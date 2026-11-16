@@ -79,6 +79,9 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   same function: `set(W, width)` -> `set(W, height)`), or `all`.
   They are generated only where a runtime switch fits. A swap the compiler rejects inside its
   own variant is reported unviable at once, without a build of its own.
+- A MISSED line also prints the mutated source (`mutated: let x = (a && b || c) && d;`): the
+  statement it sits in with the mutation applied and the mutated expression in parentheses, so the
+  grouping the compiler sees is explicit. The same text is `mutated_source` in `outcomes.json`.
 
 Design: [docs/decisions/0001-mutant-schemata.md](docs/decisions/0001-mutant-schemata.md).
 

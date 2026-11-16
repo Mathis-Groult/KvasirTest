@@ -176,12 +176,22 @@ impl Serialize for ScenarioOutcome {
         S: Serializer,
     {
         // custom serialize to omit inessential info and to inline a summary.
-        let mut ss = serializer.serialize_struct("Outcome", 5)?;
+        let mut ss = serializer.serialize_struct("Outcome", 6)?;
         ss.serialize_field("scenario", &self.scenario)?;
         ss.serialize_field("summary", &self.summary())?;
         ss.serialize_field("log_path", &self.log_path)?;
         ss.serialize_field("diff_path", &self.diff_path)?;
         ss.serialize_field("phase_results", &self.phase_results)?;
+        // KvasirTest: the mutated source lines, expression site in parentheses.
+        // Only for misses: outcomes.json is rewritten after every mutant.
+        if let Some(excerpt) = self
+            .scenario
+            .mutant()
+            .filter(|_| self.mutant_missed())
+            .and_then(crate::excerpt::excerpt)
+        {
+            ss.serialize_field("mutated_source", &excerpt)?;
+        }
         ss.end()
     }
 }

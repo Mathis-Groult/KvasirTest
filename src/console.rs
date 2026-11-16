@@ -114,6 +114,14 @@ impl Console {
                     .as_str(),
             );
         }
+        // KvasirTest: the mutated source of a miss, so it can be rebuilt by hand exactly.
+        // (Schema mode only: upstream's tests pin the classic console output.)
+        if options.schemata
+            && outcome.mutant_missed()
+            && let Some(excerpt) = scenario.mutant().and_then(crate::excerpt::excerpt)
+        {
+            s.push_str(&format!("\n         mutated: {}", style(excerpt).dim()));
+        }
         s.push('\n');
         self.message(&s);
         if let Some(mutant) = scenario.mutant()
