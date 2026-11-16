@@ -16,6 +16,8 @@
 //! contexts or patterns): a classic build per literal of every array length would cost more
 //! than it finds.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use clap::ValueEnum;
 use serde::Deserialize;
 use syn::{Expr, Lit};
@@ -30,6 +32,7 @@ pub enum ExtraKind {
     Literal,
     DropOperand,
     SwapArgs,
+    EnumVariant,
 }
 
 /// The extra kinds a run generates.
@@ -123,6 +126,114 @@ fn same_shape(a: &Expr, b: &Expr) -> bool {
     }
 }
 
+/// `Type::Variant` paths used as values in one file, by type key (`Self` keyed by its impl), so a
+/// use can be swapped for a sibling the file itself uses.
+#[derive(Debug, Default)]
+pub struct VariantUses(BTreeMap<String, BTreeSet<String>>);
+
+impl VariantUses {
+    /// Collect the uses in `file` (values only: not patterns, types or call callees).
+    pub fn of(file: &syn::File) -> Self {
+        let mut c = VariantCollector::default();
+        syn::visit::Visit::visit_file(&mut c, file);
+        c.uses
+    }
+
+    /// The next sibling (cyclic, in name order) of `variant` under `key`, if the file uses one.
+    pub fn sibling(&self, key: &str, variant: &str) -> Option<&str> {
+        let set = self.0.get(key)?;
+        if set.len() < 2 {
+            return None;
+        }
+        set.range::<str, _>((
+            std::ops::Bound::Excluded(variant),
+            std::ops::Bound::Unbounded,
+        ))
+        .next()
+        .or_else(|| set.iter().next())
+        .map(String::as_str)
+        .filter(|s| *s != variant)
+    }
+}
+
+/// Atomic orderings: a swap is invisible to single-threaded tests.
+const ATOMIC: [&str; 5] = ["Relaxed", "Acquire", "Release", "AcqRel", "SeqCst"];
+
+/// The type key and variant of `Type::Variant` (both CamelCase, at least two segments, no
+/// generic arguments), with `Self` keyed by the enclosing impl; `None` for anything else.
+pub fn variant_path(path: &syn::Path, impl_ty: Option<&str>) -> Option<(String, String)> {
+    let n = path.segments.len();
+    if n < 2 || path.segments.iter().any(|s| !s.arguments.is_none()) {
+        return None;
+    }
+    let ty = path.segments[n - 2].ident.to_string();
+    let variant = path.segments[n - 1].ident.to_string();
+    // CamelCase or one capital (`Axis::X`); `ALL_CAPS` is a constant, not a variant.
+    let camel = |s: &str| {
+        s.starts_with(|c: char| c.is_ascii_uppercase())
+            && (s.len() == 1 || s.chars().any(|c| c.is_ascii_lowercase()))
+    };
+    if !camel(&ty) || !camel(&variant) || ATOMIC.contains(&variant.as_str()) {
+        return None;
+    }
+    let prefix: Vec<String> = path
+        .segments
+        .iter()
+        .take(n - 1)
+        .map(|s| s.ident.to_string())
+        .collect();
+    let key = if ty == "Self" {
+        format!("Self in {}", impl_ty?)
+    } else {
+        prefix.join("::")
+    };
+    Some((key, variant))
+}
+
+#[derive(Default)]
+struct VariantCollector {
+    uses: VariantUses,
+    impls: Vec<String>,
+    callees: BTreeSet<(usize, usize)>,
+}
+
+fn start_of(s: proc_macro2::Span) -> (usize, usize) {
+    (s.start().line, s.start().column)
+}
+
+impl<'ast> syn::visit::Visit<'ast> for VariantCollector {
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        self.impls
+            .push(quote::ToTokens::to_token_stream(&i.self_ty).to_string());
+        syn::visit::visit_item_impl(self, i);
+        self.impls.pop();
+    }
+
+    fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
+        self.callees
+            .insert(start_of(syn::spanned::Spanned::span(&*i.func)));
+        syn::visit::visit_expr_call(self, i);
+    }
+
+    fn visit_expr_path(&mut self, i: &'ast syn::ExprPath) {
+        if i.qself.is_none()
+            && !self
+                .callees
+                .contains(&start_of(syn::spanned::Spanned::span(i)))
+            && let Some((key, variant)) =
+                variant_path(&i.path, self.impls.last().map(String::as_str))
+        {
+            self.uses.0.entry(key).or_default().insert(variant);
+        }
+    }
+
+    fn visit_pat(&mut self, _: &'ast syn::Pat) {}
+
+    fn visit_type(&mut self, _: &'ast syn::Type) {}
+
+    fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+}
+
 /// Replacement texts for a literal; empty when the kind has none.
 pub fn literal_replacements(lit: &Lit) -> Vec<String> {
     match lit {
@@ -194,6 +305,36 @@ mod test {
     }
 
     #[test]
+    fn enum_variants_swap_with_a_sibling_the_file_uses() {
+        let file: syn::File = syn::parse_str(
+            r#"
+            fn f(a: bool) -> Shape {
+                let o = Ordering::Relaxed;
+                let p = Ordering::SeqCst;
+                match q { Shape::Pat => 1, _ => 2 };
+                let w = Wrap::One(3);
+                if a { Shape::Tall } else { Shape::Low }
+            }
+            fn g() -> Shape { Shape::None }
+            impl Shape { fn h() -> Self { Self::Low } fn k() -> Self { Self::Tall } }
+            "#,
+        )
+        .unwrap();
+        let uses = VariantUses::of(&file);
+        assert_eq!(uses.sibling("Shape", "Tall"), Some("Low"));
+        assert_eq!(uses.sibling("Shape", "Low"), Some("None"));
+        assert_eq!(uses.sibling("Shape", "None"), Some("Tall"));
+        assert_eq!(uses.sibling("Self in Shape", "Low"), Some("Tall"));
+        assert_eq!(uses.sibling("Ordering", "Relaxed"), None);
+        assert_eq!(uses.sibling("Wrap", "One"), None);
+        assert!(uses.0.get("Shape").is_some_and(|s| !s.contains("Pat")));
+        let path = |s: &str| syn::parse_str::<syn::Path>(s).unwrap();
+        assert!(variant_path(&path("Axis::X"), None).is_some());
+        assert!(variant_path(&path("display::SCALE"), None).is_none());
+        assert!(variant_path(&path("Tracked::SCALE"), None).is_none());
+    }
+
+    #[test]
     fn call_statements() {
         let e = |s: &str| syn::parse_str::<Expr>(s).unwrap();
         assert!(is_call(&e("f(1)")));
@@ -260,6 +401,31 @@ fn f(s: &S, a: bool, b: bool) -> u8 {
                 .unwrap()
                 .iter()
                 .all(|m| !matches!(m.genre, crate::Genre::Literal))
+        );
+    }
+
+    #[test]
+    fn the_visitor_swaps_enum_variant_values_only() {
+        let code = r#"
+fn f(a: bool, q: Shape) -> Shape {
+    match q { Shape::Low => {} _ => {} }
+    let w = Wrap::One(3);
+    if a { Shape::Tall } else { Shape::Low }
+}
+"#;
+        let options = crate::Options::from_arg_strs(["mutants", "--extra-mutants", "enum-variant"]);
+        let names: Vec<String> = crate::visit::mutate_source_str(code, &options)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.genre == crate::Genre::EnumVariant)
+            .map(|m| m.name(false))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "src/main.rs: replace Shape::Tall with Shape::Low in f",
+                "src/main.rs: replace Shape::Low with Shape::Tall in f",
+            ]
         );
     }
 

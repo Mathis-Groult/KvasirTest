@@ -41,6 +41,8 @@ pub enum Genre {
     DropOperand,
     /// Swap two adjacent call arguments of the same shape (`--extra-mutants`).
     SwapArgs,
+    /// Replace `Type::A` with a sibling `Type::B` used in the same file (`--extra-mutants`).
+    EnumVariant,
     /// A hand-written textual edit from a `--custom-mutants` spec (added by `KvasirTest`).
     Custom,
 }
@@ -49,7 +51,7 @@ impl Genre {
     /// Kinds whose variant may not type-check (`KvasirTest`): a compiler error inside such a
     /// mutant's own variant in the schema makes it unviable without a classic build.
     pub fn may_not_type_check(&self) -> bool {
-        matches!(self, Genre::SwapArgs)
+        matches!(self, Genre::SwapArgs | Genre::EnumVariant)
     }
 }
 

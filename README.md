@@ -73,8 +73,8 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
 - `--extra-mutants KIND,..` adds mutation kinds cargo-mutants does not generate (off by default,
   so existing counts stay put): `delete-call` (delete a call statement), `literal` (integers
   ±1, floats to 0.0, bools flipped, strings emptied), `drop-operand` (`a && b` -> `a`, -> `b`),
-  `swap-args` (adjacent call arguments of the same shape: `v(t.x, t.y)` -> `v(t.y, t.x)`), or
-  `all`. A swap the compiler rejects inside its own variant is reported unviable without a
+  `swap-args` (adjacent call arguments of the same shape: `v(t.x, t.y)` -> `v(t.y, t.x)`),
+  `enum-variant` (`Shape::Tall` -> another `Shape::` variant the same file uses), or `all`. A swap the compiler rejects inside its own variant is reported unviable without a
   build of its own. They are generated only where a runtime switch fits and keep the type of the code
   they replace, so they almost never need a build of their own.
 

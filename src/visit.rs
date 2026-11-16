@@ -169,6 +169,13 @@ fn walk_file_collecting(
         pat_depth: 0,
         const_eval_literals: std::collections::HashSet::new(),
         collect,
+        variant_uses: if collect && options.extra.has(ExtraKind::EnumVariant) {
+            extra::VariantUses::of(&syn_file)
+        } else {
+            extra::VariantUses::default()
+        },
+        impl_types: Vec::new(),
+        callees: std::collections::HashSet::new(),
     };
     visitor.visit_file(&syn_file);
     Ok((visitor.mutants, visitor.external_mods))
@@ -319,6 +326,13 @@ struct DiscoveryVisitor<'o> {
 
     /// Generate mutants (false: only find `mod` statements).
     collect: bool,
+
+    /// `Type::Variant` values this file uses (`--extra-mutants enum-variant`).
+    variant_uses: extra::VariantUses,
+    /// Self types of the impls enclosing the node, innermost last.
+    impl_types: Vec<String>,
+    /// Starts (line, column) of call callees: `Wrap::One(..)` is a constructor, not a value.
+    callees: std::collections::HashSet<(usize, usize)>,
 }
 
 impl DiscoveryVisitor<'_> {
@@ -572,6 +586,34 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         syn::visit::visit_expr_lit(self, i);
     }
 
+    /// `--extra-mutants enum-variant`: `Type::A` -> a sibling `Type::B` this file also uses.
+    fn visit_expr_path(&mut self, i: &'ast ExprPath) {
+        let start = i.span().start();
+        if self.extra_here(ExtraKind::EnumVariant)
+            && i.qself.is_none()
+            && !self.callees.contains(&(start.line, start.column))
+            && let Some((key, variant)) =
+                extra::variant_path(&i.path, self.impl_types.last().map(String::as_str))
+            && let Some(sibling) = self.variant_uses.sibling(&key, &variant)
+        {
+            let span: Span = i.span().into();
+            let original = span.extract(self.source_file.code());
+            if let Some((prefix, _)) = original.rsplit_once("::") {
+                let replacement = format!("{prefix}::{sibling}");
+                self.collect_mutant_text(
+                    span,
+                    replacement,
+                    Genre::EnumVariant,
+                    Some(Site {
+                        kind: SiteKind::Expr,
+                        span,
+                    }),
+                );
+            }
+        }
+        syn::visit::visit_expr_path(self, i);
+    }
+
     fn visit_pat(&mut self, i: &'ast syn::Pat) {
         self.pat_depth += 1;
         syn::visit::visit_pat(self, i);
@@ -599,6 +641,8 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             }
         }
         self.collect_arg_swaps(&i.args, i.span());
+        let callee = i.func.span().start();
+        self.callees.insert((callee.line, callee.column));
         syn::visit::visit_expr_call(self, i);
     }
 
@@ -715,7 +759,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         } else {
             type_name
         };
+        self.impl_types
+            .push(i.self_ty.to_token_stream().to_string());
         self.in_namespace(&name, |v| syn::visit::visit_item_impl(v, i));
+        self.impl_types.pop();
     }
 
     /// Visit `trait Foo { ... }`
