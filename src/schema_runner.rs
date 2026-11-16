@@ -175,11 +175,11 @@ impl Unit {
         }
     }
 
-    fn argv(&self, args: &TestArgs, options: &Options) -> Vec<String> {
+    fn argv(&self, test_args: &TestArgs, options: &Options) -> Vec<String> {
         match &self.kind {
             UnitKind::Test { executable, name } => {
                 let mut argv = vec![executable.to_string(), "--exact".to_owned(), name.clone()];
-                argv.extend(args.harness.iter().cloned());
+                argv.extend(test_args.harness.iter().cloned());
                 argv
             }
             UnitKind::DocTests => {
@@ -192,9 +192,9 @@ impl Unit {
                     },
                 );
                 argv.push("--doc".to_owned());
-                argv.extend(args.filters.iter().cloned());
+                argv.extend(test_args.filters.iter().cloned());
                 argv.push("--".to_owned());
-                argv.extend(args.harness.iter().cloned());
+                argv.extend(test_args.harness.iter().cloned());
                 argv
             }
         }
@@ -219,7 +219,7 @@ impl Unit {
     #[allow(clippy::too_many_arguments)] // all needed by Process::start
     pub fn run(
         &self,
-        args: &TestArgs,
+        test_args: &TestArgs,
         options: &Options,
         extra_env: &[(String, String)],
         timeout: Option<Duration>,
@@ -227,7 +227,7 @@ impl Unit {
         console: &Console,
     ) -> Result<(Exit, Duration)> {
         let start = Instant::now();
-        let argv = self.argv(args, options);
+        let argv = self.argv(test_args, options);
         let mut env = self.env();
         env.extend_from_slice(extra_env);
         let mut process = Process::start(&argv, &env, &self.cwd, timeout, None, output)?;
@@ -293,7 +293,7 @@ pub struct Compiled {
 pub fn build(
     root: &Utf8Path,
     packages: &[Arc<Package>],
-    args: &TestArgs,
+    test_args: &TestArgs,
     options: &Options,
     timeout: Option<Duration>,
     output: &mut ScenarioOutput,
@@ -304,7 +304,7 @@ pub fn build(
         Phase::Build,
         options,
     );
-    argv.extend(args.cargo.iter().filter(|a| *a != "--doc").cloned());
+    argv.extend(test_args.cargo.iter().filter(|a| *a != "--doc").cloned());
     argv.push("--message-format=json".to_owned());
     output.message(&argv.join(" "))?;
     let json_path = output

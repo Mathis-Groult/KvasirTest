@@ -215,6 +215,9 @@ fn test_packages(
     }
 }
 
+/// One unit's baseline run: its exit, its time, and the mutants it reaches.
+type UnitBaseline = (Exit, Duration, BTreeSet<u32>);
+
 /// The baseline: every unit, its time with no mutant active, and the mutants it reaches.
 struct Baseline {
     units: Vec<Unit>,
@@ -248,8 +251,7 @@ fn run_baseline(
     console.scenario_phase_started(label, Phase::Test);
     let units = list_units(executables, packages, args, build_dir.path())?;
     output.message(&format!("{} test units", units.len()))?;
-    let results: Mutex<Vec<Option<(Exit, Duration, BTreeSet<u32>)>>> =
-        Mutex::new(vec![None; units.len()]);
+    let results: Mutex<Vec<Option<UnitBaseline>>> = Mutex::new(vec![None; units.len()]);
     let queue = Mutex::new(units.iter().enumerate());
     thread::scope(|scope| -> Result<()> {
         let workers = (0..n_workers.min(units.len()).max(1))
