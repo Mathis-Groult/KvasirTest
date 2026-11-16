@@ -32,6 +32,8 @@ pub enum SiteKind {
     Expr,
     /// A match arm pattern: deleting the arm becomes `pattern if !G`.
     ArmPattern,
+    /// A statement: deleting it becomes `if !G { statement }`.
+    Stmt,
 }
 
 /// The syntax site of a mutant: the region the schema rewrites to hold it.
@@ -303,6 +305,15 @@ impl Renderer<'_> {
                     self.emit_guard(v.id);
                 }
             }
+            SiteKind::Stmt => {
+                for (i, v) in site.variants.iter().enumerate() {
+                    self.out.push_str(if i == 0 { "if !" } else { " && !" });
+                    self.emit_guard(v.id);
+                }
+                self.out.push_str(" { ");
+                self.emit_range(site.range.clone(), &site.children);
+                self.out.push_str(" }");
+            }
         }
         self.regions.push(Region {
             kind: RegionKind::Site,
@@ -500,6 +511,29 @@ mod test {
         assert_eq!(
             readable(&schema, &[4]),
             "fn f(x: u8) -> u8 { match x { 1 if !G4 => 10, _ => 0 } }\n"
+        );
+    }
+
+    #[test]
+    fn deleted_statement_runs_only_when_its_guard_is_off() {
+        let code = "fn f(s: &S) {\n    s.a(1 + 2);\n    s.b();\n}\n";
+        let stmt = span_of(code, "s.a(1 + 2);", 0);
+        let mutants = [
+            SchemaMutant {
+                id: 1,
+                span: stmt,
+                replacement: "",
+                site: Site {
+                    kind: SiteKind::Stmt,
+                    span: stmt,
+                },
+            },
+            expr_mutant(code, 2, "+", "1 + 2", "-"),
+        ];
+        let schema = render(code, &mutants).unwrap();
+        assert_eq!(
+            readable(&schema, &[1, 2]),
+            "fn f(s: &S) {\n    if !G1 { s.a((if G2 { 1 - 2 } else { 1 + 2 })); }\n    s.b();\n}\n"
         );
     }
 

@@ -65,6 +65,9 @@ pub struct Options {
     /// Mutants run at once in schema mode; None means CPUs minus 2.
     pub schema_jobs: Option<usize>,
 
+    /// Extra mutation kinds to generate (added by `KvasirTest`).
+    pub extra: crate::extra::Extra,
+
     /// Run a jobserver to limit concurrency between child processes.
     pub jobserver: bool,
 
@@ -370,6 +373,7 @@ impl Options {
             in_place: args.in_place,
             schemata: !args.classic && std::env::var("KVASIR_TEST_CLASSIC").as_deref() != Ok("1"),
             schema_jobs: args.schema_jobs,
+            extra: crate::extra::Extra::new(&args.extra_mutants),
             jobs: args.jobs,
             jobserver: args.jobserver,
             jobserver_tasks: args.jobserver_tasks,

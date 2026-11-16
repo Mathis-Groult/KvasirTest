@@ -24,6 +24,7 @@ use syn::{Attribute, BinOp, Block, Expr, ExprPath, File, ItemFn, ReturnType, Sig
 use tracing::{debug_span, error, info, trace, trace_span, warn};
 
 use crate::console::WalkProgress;
+use crate::extra::{self, ExtraKind};
 use crate::fnvalue::return_type_replacements;
 use crate::mutant::{Function, MutationTarget};
 use crate::package::Package;
@@ -102,7 +103,11 @@ fn walk_package(
         };
         progress.increment_files(1);
         check_interrupted()?;
-        let (mut file_mutants, external_mods) = walk_file(&source_file, error_exprs, options)?;
+        // Files the filters exclude are still walked for their `mod` statements, but generating
+        // their mutants only to drop them costs seconds on big crates.
+        let allowed = options.allows_source_file_path(&source_file.tree_relative_path);
+        let (mut file_mutants, external_mods) =
+            walk_file_collecting(&source_file, error_exprs, options, allowed)?;
         progress.increment_mutants(file_mutants.len());
         // TODO: It would be better not to spend time generating mutants from
         // files that are not going to be visited later. However, we probably do
@@ -119,7 +124,7 @@ fn walk_package(
                 filename_queue.push_back((mod_path, false));
             }
         }
-        if !options.allows_source_file_path(&source_file.tree_relative_path) {
+        if !allowed {
             continue;
         }
         mutants.append(&mut file_mutants);
@@ -137,6 +142,16 @@ pub fn walk_file(
     error_exprs: &[Expr],
     options: &Options,
 ) -> Result<(Vec<Mutant>, Vec<ExternalModRef>)> {
+    walk_file_collecting(source_file, error_exprs, options, true)
+}
+
+/// [`walk_file`], generating mutants only if `collect`.
+fn walk_file_collecting(
+    source_file: &SourceFile,
+    error_exprs: &[Expr],
+    options: &Options,
+    collect: bool,
+) -> Result<(Vec<Mutant>, Vec<ExternalModRef>)> {
     let _span = debug_span!("source_file", path = source_file.tree_relative_slashes()).entered();
     trace!("visit source file");
     let syn_file = syn::parse_str::<syn::File>(source_file.code())
@@ -151,6 +166,9 @@ pub fn walk_file(
         source_file: source_file.clone(),
         options,
         const_depth: 0,
+        pat_depth: 0,
+        const_eval_literals: std::collections::HashSet::new(),
+        collect,
     };
     visitor.visit_file(&syn_file);
     Ok((visitor.mutants, visitor.external_mods))
@@ -290,6 +308,17 @@ struct DiscoveryVisitor<'o> {
     /// How many const contexts (const/static items, const fns, array lengths, ...) enclose the
     /// node being visited. Mutants inside one cannot sit behind a runtime schema switch.
     const_depth: usize,
+
+    /// How many patterns enclose the node: literals there are not values (`--extra-mutants`).
+    pat_depth: usize,
+
+    /// Literals rustc evaluates at compile time when changed (a divisor or shift amount, an
+    /// all-literal operation): a classic build rejects their mutants by a deny lint, while a
+    /// schema hides them behind the switch, so the two modes would disagree. No literal mutants.
+    const_eval_literals: std::collections::HashSet<(usize, usize, usize, usize)>,
+
+    /// Generate mutants (false: only find `mod` statements).
+    collect: bool,
 }
 
 impl DiscoveryVisitor<'_> {
@@ -330,6 +359,9 @@ impl DiscoveryVisitor<'_> {
         genre: Genre,
         site: Option<Site>,
     ) {
+        if !self.collect {
+            return;
+        }
         let mutant = Mutant::new_discovered(
             self.source_file.clone(),
             self.fn_stack.last().cloned(),
@@ -344,6 +376,32 @@ impl DiscoveryVisitor<'_> {
             self.mutants.push(mutant);
         } else {
             trace!(name = mutant.name(false), "skip mutant by options");
+        }
+    }
+
+    /// [`Self::collect_mutant`] with the replacement already as text.
+    fn collect_mutant_text(
+        &mut self,
+        span: Span,
+        replacement: String,
+        genre: Genre,
+        site: Option<Site>,
+    ) {
+        if !self.collect {
+            return;
+        }
+        let mutant = Mutant::new_discovered(
+            self.source_file.clone(),
+            self.fn_stack.last().cloned(),
+            span,
+            None,
+            replacement,
+            genre,
+            None,
+            site.and_then(|site| self.schema_site(site)),
+        );
+        if self.options.allows_mutant(&mutant) {
+            self.mutants.push(mutant);
         }
     }
 
@@ -396,6 +454,16 @@ impl DiscoveryVisitor<'_> {
         (self.const_depth == 0).then_some(site)
     }
 
+    /// Extra mutants of `kind` are generated here: enabled, inside a function, and where a
+    /// runtime switch fits (not const contexts or patterns).
+    fn extra_here(&self, kind: ExtraKind) -> bool {
+        self.collect
+            && self.options.extra.has(kind)
+            && !self.fn_stack.is_empty()
+            && self.const_depth == 0
+            && self.pat_depth == 0
+    }
+
     /// Visit `f(self)` inside a const context.
     fn in_const<F: FnOnce(&mut Self)>(&mut self, f: F) {
         self.const_depth += 1;
@@ -418,6 +486,60 @@ impl DiscoveryVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
+    /// `--extra-mutants delete-call`: delete a call statement.
+    fn visit_stmt(&mut self, i: &'ast syn::Stmt) {
+        if let syn::Stmt::Expr(expr, Some(_)) = i
+            && extra::is_call(expr)
+            && self.extra_here(ExtraKind::DeleteCall)
+        {
+            let span: Span = i.span().into();
+            self.collect_mutant(
+                span,
+                None,
+                &TokenStream::new(),
+                Genre::DeleteCall,
+                Some(Site {
+                    kind: SiteKind::Stmt,
+                    span,
+                }),
+            );
+        }
+        syn::visit::visit_stmt(self, i);
+    }
+
+    /// `--extra-mutants literal`.
+    fn visit_expr_lit(&mut self, i: &'ast syn::ExprLit) {
+        let span: Span = i.span().into();
+        if i.attrs.is_empty()
+            && self.extra_here(ExtraKind::Literal)
+            && !self.const_eval_literals.contains(&span_key(span))
+        {
+            for rep in extra::literal_replacements(&i.lit) {
+                // Text, not a parsed TokenStream: with span locations on, every parse grows
+                // proc_macro2's global source map, which made walking big crates slow.
+                self.collect_mutant_text(
+                    span,
+                    rep,
+                    Genre::Literal,
+                    Some(Site {
+                        kind: SiteKind::Expr,
+                        span,
+                    }),
+                );
+            }
+        }
+        syn::visit::visit_expr_lit(self, i);
+    }
+
+    fn visit_pat(&mut self, i: &'ast syn::Pat) {
+        self.pat_depth += 1;
+        syn::visit::visit_pat(self, i);
+        self.pat_depth -= 1;
+    }
+
+    /// Attributes hold no run-time code (and `#[doc = \"..\"]` is a literal).
+    fn visit_attribute(&mut self, _i: &'ast Attribute) {}
+
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
         let _span = trace_span!("expr_call", line = i.span().start().line).entered();
         if attrs_excluded(&i.attrs) {
@@ -712,6 +834,24 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         for rep in replacements {
             self.collect_mutant(i.op.span().into(), None, &rep, Genre::BinaryOperator, site);
         }
+        if self.extra_here(ExtraKind::Literal) {
+            self.const_eval_literals
+                .extend(extra::const_eval_literals(i).map(|e| span_key(e.span().into())));
+        }
+        if matches!(i.op, BinOp::And(_) | BinOp::Or(_))
+            && site.is_some()
+            && self.extra_here(ExtraKind::DropOperand)
+        {
+            for operand in [&i.left, &i.right] {
+                self.collect_mutant(
+                    i.span().into(),
+                    None,
+                    &operand.to_token_stream(),
+                    Genre::DropOperand,
+                    site,
+                );
+            }
+        }
         syn::visit::visit_expr_binary(self, i);
     }
 
@@ -868,6 +1008,11 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
 
         syn::visit::visit_expr_struct(self, i);
     }
+}
+
+/// A hashable key of a span (line, column of start and end).
+fn span_key(s: Span) -> (usize, usize, usize, usize) {
+    (s.start.line, s.start.column, s.end.line, s.end.column)
 }
 
 /// True for a `&&` chain with a `let` condition in it (`if let Some(x) = a && x > 1`).

@@ -33,6 +33,12 @@ pub enum Genre {
     MatchArmGuard,
     /// Delete a field from a struct literal that has a base (default) expression.
     StructField,
+    /// Delete a call statement (`--extra-mutants`, added by `KvasirTest`).
+    DeleteCall,
+    /// Change a literal (`--extra-mutants`).
+    Literal,
+    /// Replace `a && b` or `a || b` with one operand (`--extra-mutants`).
+    DropOperand,
     /// A hand-written textual edit from a `--custom-mutants` spec (added by `KvasirTest`).
     Custom,
 }
@@ -288,10 +294,10 @@ impl Mutant {
                 } else {
                     v.push(s("replace "));
                 }
-                v.push(s(self.original_text()).yellow());
+                v.push(s(squash_lines(&self.original_text())).yellow());
                 if !self.replacement.is_empty() {
                     v.push(s(" with "));
-                    v.push(s(&self.replacement).bright().yellow());
+                    v.push(s(squash_lines(&self.replacement)).bright().yellow());
                 }
             }
         }

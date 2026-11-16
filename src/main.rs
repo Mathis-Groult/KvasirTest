@@ -19,6 +19,7 @@ mod console;
 mod copy_tree;
 mod custom;
 mod exit_code;
+mod extra;
 mod fnvalue;
 mod glob;
 mod in_diff;
@@ -391,6 +392,10 @@ pub struct Args {
     /// slash match the entire path. If used together with `--exclude` argument, then the files to be examined are matched before the files to be excluded.
     #[arg(long, short = 'f', help_heading = "Filters")]
     file: Vec<String>,
+
+    /// Also generate these mutation kinds (comma-separated; off by default): delete-call (call statements), literal (numbers, bools, strings), drop-operand (one side of && and ||), or all
+    #[arg(long, value_enum, value_delimiter = ',', help_heading = "Generate")]
+    extra_mutants: Vec<extra::ExtraKind>,
 
     /// Also test the hand-written mutants of this TOML spec (`[[mutant]]` name, file, old, new); repeatable, not subject to the other filters
     #[arg(long, help_heading = "Generate")]

@@ -70,6 +70,11 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
 
   The switch goes around the smallest enclosing expression or statement list, so the schema runs
   exactly the edited code. Custom mutants are not subject to `--file`/`--re`/`--exclude`.
+- `--extra-mutants KIND,..` adds mutation kinds cargo-mutants does not generate (off by default,
+  so existing counts stay put): `delete-call` (delete a call statement), `literal` (integers
+  ±1, floats to 0.0, bools flipped, strings emptied), `drop-operand` (`a && b` -> `a`, -> `b`),
+  or `all`. They are generated only where a runtime switch fits and keep the type of the code
+  they replace, so they almost never need a build of their own.
 
 Design: [docs/decisions/0001-mutant-schemata.md](docs/decisions/0001-mutant-schemata.md).
 
