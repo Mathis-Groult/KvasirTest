@@ -1,5 +1,5 @@
 // Copyright 2026 Mathis Groult
-// KvasirTest: see docs/decisions/0002-test-mode-reach-map.md.
+// SPDX-License-Identifier: GPL-3.0-or-later (KvasirTest; see NOTICE)
 
 //! Functions of a source file for `test` mode: a stable key and a hash per function, a hash of
 //! everything else in the file, and the probes that record which functions a test executes.

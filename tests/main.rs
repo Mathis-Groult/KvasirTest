@@ -59,7 +59,7 @@ fn show_version() {
         .args(["mutants", "--version"])
         .assert()
         .success()
-        .stdout(predicates::str::is_match(r"^cargo-mutants \d+\.\d+\.\d+(-.*)?\n$").unwrap());
+        .stdout(predicates::str::is_match(r"^kvasir-test \d+\.\d+\.\d+(-.*)?\n$").unwrap());
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn show_help() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "Usage: cargo mutants [OPTIONS] [-- <CARGO_TEST_ARGS>...]",
+            "Usage: kvasir-test mutants [OPTIONS] [-- <CARGO_TEST_ARGS>...]",
         ));
 }
 
@@ -1462,6 +1462,7 @@ fn interrupt_caught_and_kills_children() {
     let args = [
         main_binary().to_str().unwrap(),
         "mutants",
+        "--classic",
         "--timeout=300",
         "--baseline=skip",
         "--level=trace",

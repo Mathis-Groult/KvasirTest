@@ -6,7 +6,10 @@ use std::env;
 
 /// Create a Command to run cargo-mutants for integration tests.
 pub fn run() -> assert_cmd::Command {
-    let mut cmd = assert_cmd::Command::new(assert_cmd::cargo_bin!("cargo-mutants"));
+    let mut cmd = assert_cmd::Command::new(assert_cmd::cargo_bin!("kvasir-test"));
+    // These tests were written for upstream's one-build-per-mutant mode: keep testing it.
+    // KvasirTest's schema mode is checked against it separately.
+    cmd.env("KVASIR_TEST_CLASSIC", "1");
     // Strip any options configured in the environment running these tests,
     // so that they don't cause unexpected behavior in the code under test.
     //
@@ -44,5 +47,5 @@ pub fn run() -> assert_cmd::Command {
 /// other platforms.
 #[cfg(unix)]
 pub fn main_binary() -> &'static std::path::Path {
-    assert_cmd::cargo_bin!("cargo-mutants")
+    assert_cmd::cargo_bin!("kvasir-test")
 }

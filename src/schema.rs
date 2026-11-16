@@ -1,5 +1,5 @@
 // Copyright 2026 Mathis Groult
-// KvasirTest addition to cargo-mutants (MIT): see docs/decisions/0001-mutant-schemata.md.
+// SPDX-License-Identifier: GPL-3.0-or-later (KvasirTest; see NOTICE)
 
 //! Mutant schemata: one source text holding every mutant of a file, each behind a runtime guard.
 //!

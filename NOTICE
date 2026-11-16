@@ -1,0 +1,13 @@
+KvasirTest
+Copyright (C) 2026 Mathis Groult
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version. See LICENSE.
+
+KvasirTest is a fork of cargo-mutants 27.1.0 (https://github.com/sourcefrog/cargo-mutants),
+Copyright (c) 2021 Martin Pool, distributed under the MIT licence reproduced in LICENSE-MIT. The
+MIT notice applies to the code taken from cargo-mutants; files carrying Martin Pool's copyright
+line keep it. Files added by KvasirTest (src/schema*.rs, src/probe.rs, src/reach_map.rs,
+src/mirror.rs, src/test_mode.rs, docs/decisions/) and the changes made to the other files are
+licensed under the GPL as above.

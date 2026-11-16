@@ -368,7 +368,7 @@ impl Options {
             copy_target: (!args.no_copy_target)
                 && args.copy_target.or(config.copy_target).unwrap_or(false),
             in_place: args.in_place,
-            schemata: args.schemata,
+            schemata: !args.classic && std::env::var("KVASIR_TEST_CLASSIC").as_deref() != Ok("1"),
             schema_jobs: args.schema_jobs,
             jobs: args.jobs,
             jobserver: args.jobserver,

@@ -1,5 +1,5 @@
 // Copyright 2026 Mathis Groult
-// KvasirTest addition to cargo-mutants (MIT): see docs/decisions/0001-mutant-schemata.md.
+// SPDX-License-Identifier: GPL-3.0-or-later (KvasirTest; see NOTICE)
 
 //! Test units of a schema run: every test of the built test executables, run one per process
 //! without cargo, plus one unit for a package's doc tests (those are built per run by rustdoc, so

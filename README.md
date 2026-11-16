@@ -1,88 +1,93 @@
-# cargo-mutants
+# KvasirTest
 
-<https://github.com/sourcefrog/cargo-mutants>
+Fast Rust testing, in two modes:
 
-[![Tests](https://github.com/sourcefrog/cargo-mutants/actions/workflows/tests.yml/badge.svg?branch=main&event=push)](https://github.com/sourcefrog/cargo-mutants/actions/workflows/tests.yml?query=branch%3Amain)
-[![crates.io](https://img.shields.io/crates/v/cargo-mutants.svg)](https://crates.io/crates/cargo-mutants)
-[![libs.rs](https://img.shields.io/badge/libs.rs-cargo--mutants-blue)](https://lib.rs/crates/cargo-mutants)
-[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-%E2%9D%A4-%23db61a2.svg?&logo=github&logoColor=white&labelColor=181717&style=flat-square)](https://github.com/sponsors/sourcefrog)
-[![Donate](https://img.shields.io/badge/Stripe-Donate-blue)](https://donate.stripe.com/fZu6oH6ry9I6epVfF7dfG00)
+- **`kvasir-test mutants`**: mutation testing (do your tests catch bugs?) built on
+  [cargo-mutants](https://github.com/sourcefrog/cargo-mutants) by Martin Pool, with **mutant
+  schemata**: every mutant of a run is compiled into one build behind a runtime switch, and each
+  mutant runs only on the tests that actually execute it.
+- **`kvasir-test test`**: after an edit, build once and run only the tests that can reach the
+  changed functions, in parallel.
 
-cargo-mutants helps you improve your
-program's quality by finding places where bugs could be inserted without
-causing any tests to fail.
+Both modes rest on one idea: probes compiled into your code record which tests execute which
+functions (or mutants). A test that never executes a piece of code cannot observe a change in it,
+so the selection is exact, not a heuristic.
 
-Coverage measurements can be helpful, but they really tell you what code is
-_reached_ by a test, and not whether the test really _checks_ anything about the
-behavior of the code. Mutation tests give different information, about whether
-the tests really check the code's behavior.
+## Measured
 
-The goal of cargo-mutants is to be _easy_ to run on any Rust source tree, and
-to tell you something _interesting_ about areas where bugs might be lurking or
-the tests might be insufficient.
+On a 284,000-line crate with 714 tests (the KvasirMC Minecraft server engine, debug builds, a
+6-core VPS):
 
-**For more background, see the [slides](https://docs.google.com/presentation/d/1YDwHz6ysRRNYRDtv80EMRAs4FQu2KKQ-IbGu2jrqswY/edit?pli=1&slide=id.g2876539b71f_0_0) and [video](https://www.youtube.com/watch?v=PjDHe-PkOy8&pp=ygUNY2FyZ28tbXV0YW50cw%3D%3D) from my Rustconf 2024 talk.**
+| | Plain tools | KvasirTest |
+|---|---|---|
+| 88 mutants of one file, mutation testing | 10,001 s (cargo-mutants, one build per mutant) | **381 s**, the same verdict on every mutant |
+| Tests after editing one function | 124 s (all 714 tests) | **7 s** (1 test, the one that reaches it) |
+| Run with nothing changed | 124 s | **5 s** |
 
-**The main documentation is the user guide at <https://mutants.rs/>.**
-
-## Prerequisites
-
-cargo-mutants can help on trees with non-flaky tests that run under `cargo test` or [`cargo nextest run`](https://nexte.st/).
+The 10,001 s run also had slower test builds (the crate's opt-level was raised in between; with
+that change alone the plain run would take an estimated 60-80 min). On cargo-mutants' own test
+crates the schema mode gives the same verdict (caught / missed / unviable / timeout) on every
+mutant of 29 crates; it is up to 12x faster on crates with tens of mutants, and about even (or
+slower: one crate took 9.9 s instead of 7.3 s) on crates with a handful of mutants, where
+recording each test's reach costs more than it saves.
 
 ## Install
 
 ```sh
-cargo install --locked cargo-mutants
+cargo install --locked --git https://github.com/Mathis-Groult/KvasirTest
 ```
 
-You can also install using [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) or from binaries attached to GitHub releases.
+Linux (and other Unix) only: the runners use process groups and symlinks.
 
-## Quick start
-
-From within a Rust source directory, just run
+## `kvasir-test mutants`
 
 ```sh
-cargo mutants
+kvasir-test mutants -p my-crate --file src/parser.rs -- --lib
 ```
 
-To generate mutants in only one file:
+Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; see its
+[manual](https://mutants.rs/). What changes:
+
+- All mutants of the run are written into a **schema** of each mutated file, compiled once.
+  Mutants a runtime switch cannot hold (const contexts, let-chains, proc-macro and
+  build-dependency crates, type errors) are found up front or by the compiler and run the
+  classic way, one build each, so every mutant still gets a verdict.
+- The baseline runs every test in its own process and records which mutants each test reaches.
+  A mutant runs only its reaching tests, fastest first, and stops at the first failure; a mutant
+  no test reaches is reported missed without running.
+- Mutants run in parallel: CPUs minus 2 by default (`--schema-jobs N`).
+- `--classic` (or `KVASIR_TEST_CLASSIC=1`) gives cargo-mutants' one-build-per-mutant mode.
+
+Design: [docs/decisions/0001-mutant-schemata.md](docs/decisions/0001-mutant-schemata.md).
+
+## `kvasir-test test`
 
 ```sh
-cargo mutants -f src/something.rs
+kvasir-test test -p my-crate -- --lib
 ```
 
-## Integration with CI
+- The first run builds an instrumented copy of the workspace (`target/kvasir-test/tree`, built
+  into your own `target/`), runs every test once and records which functions each one executes.
+- Later runs compare function hashes (comments and formatting do not count) and run only the
+  tests that reached a changed function, plus new tests and those that failed last time. Every
+  run re-records what it ran, so the record stays exact.
+- Any change outside function bodies (types, constants, manifests, data or golden files, the
+  toolchain) runs everything. `--full` forces it; `--plan` shows what would run.
 
-The [manual includes instructions and examples for automatically testing mutants in CI](https://mutants.rs/ci.html), including incremental testing of pull requests and full testing of the development branch.
+Your source tree is never edited. Design:
+[docs/decisions/0002-test-mode-reach-map.md](docs/decisions/0002-test-mode-reach-map.md).
 
-## Help advance cargo-mutants
+## Limits
 
-If you use cargo-mutants or just like the idea you can help it get better:
+- A test whose behaviour depends on time, unseeded randomness or the network can hide what it
+  reaches; that is true of any test selection.
+- Doc tests run as one unit per package.
+- The first `test` run and the first build of a schema cost a full build.
 
-* [Post an experience report in GitHub discussions](https://github.com/sourcefrog/cargo-mutants/discussions), saying whether it worked, failed, found interesting results, etc.
-* [Sponsor development](https://github.com/sponsors/sourcefrog)
+## Licence
 
-## Project status
-
-As of August 2025 this is an actively-maintained spare time project. I expect to make [releases](https://github.com/sourcefrog/cargo-mutants/releases) about every one or two months.
-
-It's very usable at it is and there's room for lots more future improvement, especially in adding new types of mutation.
-
-If you try it out on your project, [I'd love to hear back in a github discussion](https://github.com/sourcefrog/cargo-mutants/discussions/categories/general) whether it worked well or what could be better:
-
-* Did it work on your tree? Did you need to set any options or do any debugging to get it working?
-* Did it find meaningful gaps in testing? Where there too many false positives?
-* What do you think would make it better or easier?
-
-This software is provided as-is with no warranty of any kind.
-
-## Further reading
-
-See also:
-
-* [cargo-mutants manual](https://mutants.rs/)
-* [How cargo-mutants compares to other techniques and tools](https://github.com/sourcefrog/cargo-mutants/wiki/Compared).
-* [Design notes](DESIGN.md)
-* [Contributing](CONTRIBUTING.md)
-* [Release notes](NEWS.md)
-* [Discussions](https://github.com/sourcefrog/cargo-mutants/discussions)
+KvasirTest is free software under the **GNU GPL, version 3 or later** ([LICENSE](LICENSE)).
+It is a fork of cargo-mutants 27.1.0, copyright Martin Pool, used under the MIT licence
+([LICENSE-MIT](LICENSE-MIT)); that notice applies to the code taken from cargo-mutants. See
+[NOTICE](NOTICE). cargo-mutants' own README is kept in
+[docs/upstream-README.md](docs/upstream-README.md).

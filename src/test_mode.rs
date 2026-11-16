@@ -1,5 +1,5 @@
 // Copyright 2026 Mathis Groult
-// KvasirTest: see docs/decisions/0002-test-mode-reach-map.md.
+// SPDX-License-Identifier: GPL-3.0-or-later (KvasirTest; see NOTICE)
 
 //! `kvasir-test test`: build once, run only the tests a change can reach, in parallel, and keep
 //! the reach map exact by recording every run.

@@ -1,5 +1,5 @@
 // Copyright 2026 Mathis Groult
-// KvasirTest: see docs/decisions/0002-test-mode-reach-map.md.
+// SPDX-License-Identifier: GPL-3.0-or-later (KvasirTest; see NOTICE)
 
 //! The mirror tree of `test` mode: an instrumented copy of the workspace that builds into the
 //! workspace's own target directory. A file is only rewritten when its content changes, so the

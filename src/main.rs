@@ -1,8 +1,8 @@
 // Copyright 2021-2026 Martin Pool
 
-//! `cargo-mutants`: Find test gaps by inserting bugs.
-//!
-//! See <https://mutants.rs> for the manual and more information.
+//! `kvasir-test`: fast Rust testing. A fork of `cargo-mutants` (find test gaps by inserting bugs,
+//! <https://mutants.rs>) with mutant schemata, plus `test` mode (run only the tests a change can
+//! reach). See README.md.
 
 #![warn(clippy::pedantic)]
 #![allow(
@@ -108,11 +108,21 @@ fn clap_styles() -> Styles {
 }
 
 #[derive(Parser)]
-#[command(name = "cargo", bin_name = "cargo", styles(clap_styles()))]
+#[command(
+    name = "kvasir-test",
+    bin_name = "kvasir-test",
+    version,
+    styles(clap_styles())
+)]
 enum Cargo {
-    #[command(name = "mutants", styles(clap_styles()))]
+    /// Mutation testing: inject bugs and see whether your tests catch them.
+    #[command(
+        name = "mutants",
+        about = "Mutation testing: inject bugs and see whether your tests catch them",
+        styles(clap_styles())
+    )]
     Mutants(Args),
-    /// Run only the tests a change can reach (KvasirTest).
+    /// Run only the tests a change can reach.
     #[command(name = "test", styles(clap_styles()))]
     Test(test_mode::TestModeArgs),
 }
@@ -277,10 +287,12 @@ pub struct Args {
     )]
     jobs: Option<usize>,
 
-    /// Build all mutants of the run into one schema (each behind a runtime switch) and run them
-    /// in parallel without rebuilding; mutants the schema cannot hold run one build each.
+    /// Use upstream cargo-mutants' mode: one build per mutant. By default KvasirTest builds all
+    /// mutants into one schema (each behind a runtime switch) and runs each mutant only on the
+    /// tests that reach it; mutants a schema cannot hold run one build each. The environment
+    /// variable `KVASIR_TEST_CLASSIC=1` has the same effect.
     #[arg(long, help_heading = "Execution")]
-    schemata: bool,
+    classic: bool,
 
     /// Run this many mutants at once in schema mode (default: CPUs minus 2, at least 1).
     #[arg(long, env = "KVASIR_TEST_SCHEMA_JOBS", help_heading = "Execution")]
@@ -537,7 +549,12 @@ fn main() -> Result<ExitCode> {
         println!("{NAME} {VERSION}");
         return Ok(ExitCode::Success);
     } else if let Some(shell) = args.completions {
-        generate(shell, &mut Cargo::command(), "cargo", &mut io::stdout());
+        generate(
+            shell,
+            &mut Cargo::command(),
+            "kvasir-test",
+            &mut io::stdout(),
+        );
         return Ok(ExitCode::Success);
     } else if let Some(schema_type) = args.emit_schema {
         emit_schema(schema_type)?;
