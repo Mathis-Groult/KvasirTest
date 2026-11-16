@@ -82,6 +82,15 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
 - A MISSED line also prints the mutated source (`mutated: let x = (a && b || c) && d;`): the
   statement it sits in with the mutation applied and the mutated expression in parentheses, so the
   grouping the compiler sees is explicit. The same text is `mutated_source` in `outcomes.json`.
+- `--fn PATH` (repeatable) keeps only mutants inside the named functions, matched by path
+  segments without generic arguments: `--fn ProtoNode::write_to` matches `ProtoNode<'_>::write_to`,
+  `--fn TextDisplayEntity::init_data_tracker` matches
+  `<impl EntityBase for TextDisplayEntity>::init_data_tracker`. Prefer it to `--re`: `--re`
+  matches the whole printed name, which includes generic arguments (so `--re
+  'ProtoNode::write_to'` finds nothing) and the mutated text (`--re write_nbt` also picks
+  `delete self.x.write_nbt(..)` in callers). Name formats: `replace <fn> -> <type> with <value>`
+  for whole bodies, `<change> in <fn>` otherwise, with `<fn>` as `Type<generics>::method`,
+  `<impl Trait for Type>::method`, `module::free_fn`; closures belong to the function they are in.
 - Known equivalent mutants go in `.cargo/mutants-equivalent.toml` (or `--equivalent FILE`):
   `[[equivalent]] name = "<name as printed, :line:col optional>"`, `reason = ".."`, optional
   `line = N` when the name repeats in one function. They are not tested, print as `EQUIV` with

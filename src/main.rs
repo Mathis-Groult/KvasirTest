@@ -22,6 +22,7 @@ mod equivalent;
 mod excerpt;
 mod exit_code;
 mod extra;
+mod fn_filter;
 mod fnvalue;
 mod glob;
 mod in_diff;
@@ -399,6 +400,10 @@ pub struct Args {
     #[arg(long, value_enum, value_delimiter = ',', help_heading = "Generate")]
     extra_mutants: Vec<extra::ExtraKind>,
 
+    /// Only mutants inside this function, by path without generic arguments (`Type::method`, `method`, `<impl Trait for Type>::method` or `Type::method`); repeatable
+    #[arg(long = "fn", value_name = "PATH", help_heading = "Filters")]
+    examine_fns: Vec<String>,
+
     /// Known equivalent mutants (TOML `[[equivalent]]` name, reason): not tested, shown as EQUIV, not counted as missed; default .cargo/mutants-equivalent.toml in the workspace
     #[arg(long, help_heading = "Filters")]
     equivalent: Option<Utf8PathBuf>,
@@ -666,7 +671,8 @@ fn main() -> Result<ExitCode> {
         };
     }
     mutants.extend(custom::load(&args.custom_mutants, &workspace)?);
-    let name_filtered = !args.examine_re.is_empty() || !args.exclude_re.is_empty();
+    let name_filtered =
+        !args.examine_re.is_empty() || !args.exclude_re.is_empty() || !args.examine_fns.is_empty();
     let (kept, equivalent) =
         equivalent::Equivalents::load(args.equivalent.as_deref(), workspace.root())?
             .split(mutants, name_filtered);

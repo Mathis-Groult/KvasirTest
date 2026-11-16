@@ -65,6 +65,9 @@ pub struct Options {
     /// Mutants run at once in schema mode; None means CPUs minus 2.
     pub schema_jobs: Option<usize>,
 
+    /// `--fn`: only mutants inside these functions (added by `KvasirTest`).
+    pub examine_fns: Vec<String>,
+
     /// Extra mutation kinds to generate (added by `KvasirTest`).
     pub extra: crate::extra::Extra,
 
@@ -374,6 +377,7 @@ impl Options {
             schemata: !args.classic && std::env::var("KVASIR_TEST_CLASSIC").as_deref() != Ok("1"),
             schema_jobs: args.schema_jobs,
             extra: crate::extra::Extra::new(&args.extra_mutants),
+            examine_fns: args.examine_fns.clone(),
             jobs: args.jobs,
             jobserver: args.jobserver,
             jobserver_tasks: args.jobserver_tasks,
@@ -490,7 +494,12 @@ impl Options {
     /// True if the options allow this mutant to be tested.
     pub fn allows_mutant(&self, mutant: &Mutant) -> bool {
         let name = mutant.name(true);
-        (self.examine_name_re.is_empty() || self.examine_name_re.is_match(&name))
+        (self.examine_fns.is_empty()
+            || crate::fn_filter::matches(
+                &self.examine_fns,
+                mutant.function.as_ref().map(|f| f.function_name.as_str()),
+            ))
+            && (self.examine_name_re.is_empty() || self.examine_name_re.is_match(&name))
             && (self.exclude_name_re.is_empty() || !self.exclude_name_re.is_match(&name))
     }
 
