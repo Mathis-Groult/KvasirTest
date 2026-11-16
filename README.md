@@ -74,7 +74,9 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   so existing counts stay put): `delete-call` (delete a call statement), `literal` (integers
   ±1, floats to 0.0, bools flipped, strings emptied), `drop-operand` (`a && b` -> `a`, -> `b`),
   `swap-args` (adjacent call arguments of the same shape: `v(t.x, t.y)` -> `v(t.y, t.x)`),
-  `enum-variant` (`Shape::Tall` -> another `Shape::` variant the same file uses), or `all`.
+  `enum-variant` (`Shape::Tall` -> another `Shape::` variant the same file uses),
+  `substitute-arg` (an argument -> another passed at the same position of the same call in the
+  same function: `set(W, width)` -> `set(W, height)`), or `all`.
   They are generated only where a runtime switch fits. A swap the compiler rejects inside its
   own variant is reported unviable at once, without a build of its own.
 

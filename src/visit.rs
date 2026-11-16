@@ -175,6 +175,11 @@ fn walk_file_collecting(
             extra::VariantUses::default()
         },
         impl_types: Vec::new(),
+        arg_uses: if collect && options.extra.has(ExtraKind::SubstituteArg) {
+            extra::ArgUses::of(&syn_file)
+        } else {
+            extra::ArgUses::default()
+        },
         callees: std::collections::HashSet::new(),
     };
     visitor.visit_file(&syn_file);
@@ -331,6 +336,8 @@ struct DiscoveryVisitor<'o> {
     variant_uses: extra::VariantUses,
     /// Self types of the impls enclosing the node, innermost last.
     impl_types: Vec<String>,
+    /// Arguments passed at each call position in this file (`--extra-mutants substitute-arg`).
+    arg_uses: extra::ArgUses,
     /// Starts (line, column) of call callees: `Wrap::One(..)` is a constructor, not a value.
     callees: std::collections::HashSet<(usize, usize)>,
 }
@@ -426,6 +433,51 @@ impl DiscoveryVisitor<'_> {
                 },
                 replacement,
                 Genre::SwapArgs,
+                Some(Site {
+                    kind: SiteKind::Expr,
+                    span: call.into(),
+                }),
+            );
+        }
+    }
+
+    /// `--extra-mutants substitute-arg`: an argument -> another passed at the same position of
+    /// the same callee elsewhere in the file.
+    fn collect_arg_substitutions(
+        &mut self,
+        callee: Option<String>,
+        args: &syn::punctuated::Punctuated<Expr, syn::Token![,]>,
+        call: proc_macro2::Span,
+    ) {
+        let Some(callee) = callee else {
+            return;
+        };
+        if !self.extra_here(ExtraKind::SubstituteArg) {
+            return;
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let Some(fn_line) = self.fn_stack.last().map(|f| f.span.start.line) else {
+                return;
+            };
+            let Some((key, text)) = extra::ArgUses::slot(fn_line, &callee, index, arg) else {
+                continue;
+            };
+            let Some(sibling) = self.arg_uses.sibling(&key, &text) else {
+                continue;
+            };
+            let span: Span = arg.span().into();
+            let replacement = match arg {
+                // Same base, other field: keep the base as written.
+                Expr::Field(_) => match span.extract(self.source_file.code()).rsplit_once('.') {
+                    Some((base, _)) => format!("{base}.{sibling}"),
+                    None => continue,
+                },
+                _ => sibling.to_owned(),
+            };
+            self.collect_mutant_text(
+                span,
+                replacement,
+                Genre::SubstituteArg,
                 Some(Site {
                     kind: SiteKind::Expr,
                     span: call.into(),
@@ -641,6 +693,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             }
         }
         self.collect_arg_swaps(&i.args, i.span());
+        self.collect_arg_substitutions(extra::callee_name(&i.func), &i.args, i.span());
         let callee = i.func.span().start();
         self.callees.insert((callee.line, callee.column));
         syn::visit::visit_expr_call(self, i);
@@ -656,6 +709,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             return;
         }
         self.collect_arg_swaps(&i.args, i.span());
+        self.collect_arg_substitutions(Some(i.method.to_string()), &i.args, i.span());
         syn::visit::visit_expr_method_call(self, i);
     }
 

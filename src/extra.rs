@@ -33,6 +33,7 @@ pub enum ExtraKind {
     DropOperand,
     SwapArgs,
     EnumVariant,
+    SubstituteArg,
 }
 
 /// The extra kinds a run generates.
@@ -154,6 +155,129 @@ impl VariantUses {
         .map(String::as_str)
         .filter(|s| *s != variant)
     }
+}
+
+/// Plain arguments (a variable, or a field of one base like `self.x`) passed at the same position
+/// of calls to the same function or method in one file, so one can stand in for another
+/// (`set(WIDTH, width)` -> `set(WIDTH, height)`).
+#[derive(Debug, Default)]
+pub struct ArgUses(BTreeMap<String, BTreeSet<String>>);
+
+impl ArgUses {
+    pub fn of(file: &syn::File) -> Self {
+        let mut c = ArgCollector::default();
+        syn::visit::Visit::visit_file(&mut c, file);
+        c.uses
+    }
+
+    /// Where `arg` sits: the key of its function (by start line), call position and shape, and
+    /// what varies within it (the variable, or the field name for fields of one base). Keyed by
+    /// function: across a whole file the same callee takes unrelated values.
+    pub fn slot(
+        fn_line: usize,
+        callee: &str,
+        index: usize,
+        arg: &Expr,
+    ) -> Option<(String, String)> {
+        let shape = match arg {
+            Expr::Path(p) if p.qself.is_none() => {
+                let ident = p.path.get_ident()?.to_string();
+                // A lower-case variable, not a constant or unit struct.
+                if !ident.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+                    return None;
+                }
+                "var".to_owned()
+            }
+            Expr::Field(f) => match &f.member {
+                syn::Member::Named(name) => {
+                    return Some((
+                        format!("{fn_line}:{callee}#{index} field of {}", text(&f.base)),
+                        name.to_string(),
+                    ));
+                }
+                syn::Member::Unnamed(_) => return None,
+            },
+            _ => return None,
+        };
+        Some((format!("{fn_line}:{callee}#{index} {shape}"), text(arg)))
+    }
+
+    /// The next other argument (cyclic, in text order) seen in `key`.
+    pub fn sibling(&self, key: &str, arg: &str) -> Option<&str> {
+        let set = self.0.get(key)?;
+        set.range::<str, _>((std::ops::Bound::Excluded(arg), std::ops::Bound::Unbounded))
+            .next()
+            .or_else(|| set.iter().next())
+            .map(String::as_str)
+            .filter(|s| *s != arg)
+    }
+}
+
+/// The name a call is keyed by: the method, or the last segment of a path callee.
+pub fn callee_name(func: &Expr) -> Option<String> {
+    match func {
+        Expr::Path(p) => Some(p.path.segments.last()?.ident.to_string()),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct ArgCollector {
+    uses: ArgUses,
+    /// Start lines of the functions enclosing the node.
+    fns: Vec<usize>,
+}
+
+impl ArgCollector {
+    fn add(&mut self, callee: &str, args: &syn::punctuated::Punctuated<Expr, syn::Token![,]>) {
+        let Some(&fn_line) = self.fns.last() else {
+            return;
+        };
+        for (index, arg) in args.iter().enumerate() {
+            if let Some((key, text)) = ArgUses::slot(fn_line, callee, index, arg) {
+                self.uses.0.entry(key).or_default().insert(text);
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for ArgCollector {
+    fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
+        if let Some(callee) = callee_name(&i.func) {
+            self.add(&callee, &i.args);
+        }
+        syn::visit::visit_expr_call(self, i);
+    }
+
+    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
+        self.add(&i.method.to_string(), &i.args);
+        syn::visit::visit_expr_method_call(self, i);
+    }
+
+    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+        self.fns.push(fn_line(syn::spanned::Spanned::span(i)));
+        syn::visit::visit_item_fn(self, i);
+        self.fns.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+        self.fns.push(fn_line(syn::spanned::Spanned::span(i)));
+        syn::visit::visit_impl_item_fn(self, i);
+        self.fns.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        self.fns.push(fn_line(syn::spanned::Spanned::span(i)));
+        syn::visit::visit_trait_item_fn(self, i);
+        self.fns.pop();
+    }
+
+    fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+}
+
+/// The line a function item starts on (its key in [`ArgUses`]).
+pub fn fn_line(span: proc_macro2::Span) -> usize {
+    span.start().line
 }
 
 /// Atomic orderings: a swap is invisible to single-threaded tests.
@@ -335,6 +459,31 @@ mod test {
     }
 
     #[test]
+    fn arguments_stand_in_for_others_at_the_same_call_position() {
+        let file: syn::File = syn::parse_str(
+            r"
+            fn f(e: &E, width: f32, height: f32, radius: f32) {
+                e.set(WIDTH, width);
+                e.set(HEIGHT, height);
+                e.set(RADIUS, self.radius);
+                e.set(BRIGHT, self.bright);
+                put(width, 1);
+            }
+            ",
+        )
+        .unwrap();
+        let uses = ArgUses::of(&file);
+        assert_eq!(uses.sibling("2:set#1 var", "width"), Some("height"));
+        assert_eq!(uses.sibling("2:set#1 var", "height"), Some("width"));
+        assert_eq!(
+            uses.sibling("2:set#1 field of self", "bright"),
+            Some("radius")
+        );
+        assert_eq!(uses.sibling("2:set#0 var", "WIDTH"), None);
+        assert_eq!(uses.sibling("2:put#0 var", "width"), None);
+    }
+
+    #[test]
     fn call_statements() {
         let e = |s: &str| syn::parse_str::<Expr>(s).unwrap();
         assert!(is_call(&e("f(1)")));
@@ -425,6 +574,35 @@ fn f(a: bool, q: Shape) -> Shape {
             [
                 "src/main.rs: replace Shape::Tall with Shape::Low in f",
                 "src/main.rs: replace Shape::Low with Shape::Tall in f",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_visitor_substitutes_arguments() {
+        let code = r"
+fn f(e: &E, width: f32, height: f32) {
+    e.set(1, width);
+    e.set(2, height);
+    e.set(3, self.radius);
+    e.set(4, self.bright);
+}
+";
+        let options =
+            crate::Options::from_arg_strs(["mutants", "--extra-mutants", "substitute-arg"]);
+        let names: Vec<String> = crate::visit::mutate_source_str(code, &options)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.genre == crate::Genre::SubstituteArg)
+            .map(|m| m.name(false))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "src/main.rs: replace width with height in f",
+                "src/main.rs: replace height with width in f",
+                "src/main.rs: replace self.radius with self.bright in f",
+                "src/main.rs: replace self.bright with self.radius in f",
             ]
         );
     }

@@ -43,6 +43,9 @@ pub enum Genre {
     SwapArgs,
     /// Replace `Type::A` with a sibling `Type::B` used in the same file (`--extra-mutants`).
     EnumVariant,
+    /// Replace a call argument with another one passed at the same position of the same
+    /// function elsewhere in the file (`--extra-mutants`).
+    SubstituteArg,
     /// A hand-written textual edit from a `--custom-mutants` spec (added by `KvasirTest`).
     Custom,
 }
@@ -51,7 +54,10 @@ impl Genre {
     /// Kinds whose variant may not type-check (`KvasirTest`): a compiler error inside such a
     /// mutant's own variant in the schema makes it unviable without a classic build.
     pub fn may_not_type_check(&self) -> bool {
-        matches!(self, Genre::SwapArgs | Genre::EnumVariant)
+        matches!(
+            self,
+            Genre::SwapArgs | Genre::EnumVariant | Genre::SubstituteArg
+        )
     }
 }
 
