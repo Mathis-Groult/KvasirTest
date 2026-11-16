@@ -32,7 +32,9 @@ use crate::outcome::{LabOutcome, Phase, PhaseResult, ScenarioOutcome};
 use crate::output::{OutputDir, ScenarioOutput};
 use crate::package::Package;
 use crate::process::Exit;
-use crate::schema::{ACTIVE_MUTANT_VAR, REACH_FILE_VAR, SchemaMutant, parse_reach, render};
+use crate::schema::{
+    ACTIVE_MUTANT_VAR, REACH_FILE_VAR, RegionKind, SchemaMutant, parse_reach, render,
+};
 use crate::schema_runner::{
     Compiled, Executable, TestArgs, Unit, build, list_units, parse_executables,
 };
@@ -148,6 +150,7 @@ pub fn test_mutants(
     console.start_testing_mutants(mutants.len());
 
     let mutants_start = Instant::now();
+    let mut prepared = prepared;
     let queue = Mutex::new(prepared.active.clone().into_iter());
     thread::scope(|scope| -> Result<()> {
         let workers = (0..n_workers.min(prepared.active.len()).max(1))
@@ -169,6 +172,9 @@ pub fn test_mutants(
         join_threads(workers)
     })?;
     info!(elapsed = ?mutants_start.elapsed(), "schema mutants tested");
+    for (mutant, errors) in std::mem::take(&mut prepared.unviable) {
+        record_unviable(&lab, label, mutant, &errors)?;
+    }
 
     let left_out = prepared.restore()?;
     if !left_out.is_empty() {
@@ -403,6 +409,37 @@ fn run_schema_mutant(
     Ok(outcome)
 }
 
+/// Record a mutant the compiler rejected inside its own schema variant as unviable.
+fn record_unviable(lab: &Lab<'_>, label: &Utf8Path, mutant: Mutant, errors: &str) -> Result<()> {
+    let diff = mutant.diff(&mutant.mutated_code());
+    let scenario = Scenario::Mutant(mutant);
+    let mut output = lab
+        .output_mutex
+        .lock()
+        .expect("lock output_dir to start scenario")
+        .start_scenario(&scenario)?;
+    output.write_diff(&diff)?;
+    output.message(&format!(
+        "rejected by the compiler inside its own variant of the schema build: unviable without a build of its own\n{errors}"
+    ))?;
+    lab.console
+        .scenario_started(label, &scenario, output.open_log_read()?);
+    let mut outcome = ScenarioOutcome::new(&output, scenario.clone());
+    outcome.add_phase_result(PhaseResult {
+        phase: Phase::Build,
+        duration: Duration::ZERO,
+        process_status: Exit::Failure(101),
+        argv: vec!["kvasir-test".into(), "schema build".into()],
+    });
+    lab.output_mutex
+        .lock()
+        .expect("lock output dir to add outcome")
+        .add_scenario_outcome(&outcome)?;
+    lab.console
+        .scenario_finished(label, &scenario, &outcome, lab.options);
+    Ok(())
+}
+
 /// The schema written into the build directory. Dropping it restores the original files.
 struct Prepared<'a> {
     build_dir: &'a BuildDir,
@@ -410,8 +447,10 @@ struct Prepared<'a> {
     originals: BTreeMap<Utf8PathBuf, Arc<String>>,
     /// Mutants held by the schema, with their switch id.
     active: Vec<(u32, Mutant)>,
-    /// Mutants the schema could not hold.
+    /// Mutants the schema could not hold, to run the classic way.
     left_out: Vec<Mutant>,
+    /// Mutants the compiler rejected inside their own variant, with its messages.
+    unviable: Vec<(Mutant, String)>,
     rounds: usize,
     restored: bool,
 }
@@ -469,6 +508,7 @@ fn prepare<'a>(
             .collect(),
         active: Vec::new(),
         left_out: Vec::new(),
+        unviable: Vec::new(),
         rounds: 0,
         restored: false,
     };
@@ -480,6 +520,7 @@ fn prepare<'a>(
         })
         .collect();
     let mut total = Duration::ZERO;
+    let mut unviable: BTreeMap<usize, String> = BTreeMap::new();
     let compiled = loop {
         prepared.rounds += 1;
         let mut schemas = BTreeMap::new();
@@ -509,6 +550,21 @@ fn prepare<'a>(
             break compiled;
         }
         let errors = parse_errors(&compiled.json, build_dir.path());
+        let before = out.clone();
+        // A kind that may not type-check, rejected inside its own variant: unviable, as a classic
+        // build of the same text would be, without paying for that build.
+        for e in &errors {
+            if let Some(region) = schemas.get(&e.file).and_then(|s| s.innermost(&e.range))
+                && region.kind == RegionKind::Variant
+                && let [id] = region.ids.as_slice()
+            {
+                let i = *id as usize - 1;
+                if mutants[i].genre.may_not_type_check() && !out.contains(&i) {
+                    unviable.entry(i).or_default().push_str(&e.rendered);
+                }
+            }
+        }
+        out.extend(unviable.keys().copied());
         let blamed: BTreeSet<usize> = errors
             .iter()
             .filter_map(|e| schemas.get(&e.file).map(|s| s.blame(&e.range)))
@@ -520,7 +576,7 @@ fn prepare<'a>(
             errors = errors.len(),
             blamed = blamed.len()
         );
-        if blamed.is_empty() || blamed.is_subset(&out) {
+        if blamed.is_empty() || blamed.is_subset(&before) {
             // A hand-written edit can break code outside its site (a moved value used later):
             // take those out before giving up on every mutant.
             let custom: BTreeSet<usize> = (0..mutants.len())
@@ -554,7 +610,15 @@ fn prepare<'a>(
         .filter(|i| !out.contains(i))
         .map(|i| (ids[i], mutants[i].clone()))
         .collect();
-    prepared.left_out = out.iter().map(|&i| mutants[i].clone()).collect();
+    prepared.left_out = out
+        .iter()
+        .filter(|i| !unviable.contains_key(i))
+        .map(|&i| mutants[i].clone())
+        .collect();
+    prepared.unviable = unviable
+        .into_iter()
+        .map(|(i, errors)| (mutants[i].clone(), errors))
+        .collect();
     Ok((
         prepared,
         Compiled {
@@ -569,6 +633,8 @@ fn prepare<'a>(
 struct CompileError {
     file: Utf8PathBuf,
     range: std::ops::Range<usize>,
+    /// The compiler's rendered message (empty if it gave none).
+    rendered: String,
 }
 
 /// Primary spans of error-level compiler messages, with paths relative to `root`.
@@ -578,6 +644,7 @@ fn parse_errors(json_lines: &str, root: &Utf8Path) -> Vec<CompileError> {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|v| v["reason"] == "compiler-message" && v["message"]["level"] == "error")
         .flat_map(|v| {
+            let rendered = v["message"]["rendered"].as_str().unwrap_or("").to_owned();
             v["message"]["spans"]
                 .as_array()
                 .cloned()
@@ -594,6 +661,7 @@ fn parse_errors(json_lines: &str, root: &Utf8Path) -> Vec<CompileError> {
                     Some(CompileError {
                         file,
                         range: start..end,
+                        rendered: rendered.clone(),
                     })
                 })
                 .collect_vec()

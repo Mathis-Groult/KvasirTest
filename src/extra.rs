@@ -29,6 +29,7 @@ pub enum ExtraKind {
     DeleteCall,
     Literal,
     DropOperand,
+    SwapArgs,
 }
 
 /// The extra kinds a run generates.
@@ -77,6 +78,49 @@ pub fn const_eval_literals(i: &syn::ExprBinary) -> impl Iterator<Item = &Expr> {
         .into_iter()
         .filter(move |(e, skip)| *skip && is_lit(e))
         .map(|(e, _)| e)
+}
+
+/// Adjacent call arguments that look like the same type (`t.x, t.y`; `a[0], a[1]`; two literals
+/// of one kind; two plain variables; the same method on such receivers) and differ: the index
+/// of the first of each pair.
+#[cfg(test)]
+fn swappable_pairs(args: &syn::punctuated::Punctuated<Expr, syn::Token![,]>) -> Vec<usize> {
+    swappable_pairs_of(&args.iter().collect::<Vec<_>>())
+}
+
+/// [`swappable_pairs`] over a slice.
+pub fn swappable_pairs_of(args: &[&Expr]) -> Vec<usize> {
+    (0..args.len().saturating_sub(1))
+        .filter(|&i| same_shape(args[i], args[i + 1]) && text(args[i]) != text(args[i + 1]))
+        .collect()
+}
+
+fn text(e: &Expr) -> String {
+    quote::ToTokens::to_token_stream(e).to_string()
+}
+
+fn same_shape(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Field(a), Expr::Field(b)) => text(&a.base) == text(&b.base),
+        (Expr::Index(a), Expr::Index(b)) => text(&a.expr) == text(&b.expr),
+        (Expr::Lit(a), Expr::Lit(b)) => {
+            std::mem::discriminant(&a.lit) == std::mem::discriminant(&b.lit)
+                && !matches!(a.lit, Lit::Bool(_))
+        }
+        (Expr::Path(a), Expr::Path(b)) => {
+            a.path.get_ident().is_some() && b.path.get_ident().is_some()
+        }
+        (Expr::MethodCall(a), Expr::MethodCall(b)) => {
+            a.method == b.method
+                && a.args.is_empty()
+                && b.args.is_empty()
+                && same_shape(&a.receiver, &b.receiver)
+        }
+        (Expr::Reference(a), Expr::Reference(b)) => {
+            a.mutability.is_some() == b.mutability.is_some() && same_shape(&a.expr, &b.expr)
+        }
+        _ => false,
+    }
 }
 
 /// Replacement texts for a literal; empty when the kind has none.
@@ -131,6 +175,22 @@ mod test {
         assert_eq!(reps("\"\""), ["\"xyzzy\""]);
         assert_eq!(reps("'c'"), Vec::<String>::new());
         assert_eq!(reps("b\"x\""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn swappable_arguments_have_the_same_shape() {
+        let pairs = |s: &str| match syn::parse_str::<Expr>(s).unwrap() {
+            Expr::Call(c) => swappable_pairs(&c.args),
+            Expr::MethodCall(c) => swappable_pairs(&c.args),
+            _ => panic!("not a call"),
+        };
+        assert_eq!(pairs("V(t.x, t.y, t.z)"), [0, 1]);
+        assert_eq!(pairs("V(t.x, u.y)"), Vec::<usize>::new());
+        assert_eq!(pairs("q(r[0], r[1], 2.0, 3.0)"), [0, 2]);
+        assert_eq!(pairs("f(a, b, \"s\", 1)"), [0]);
+        assert_eq!(pairs("s.set(w, h)"), [0]);
+        assert_eq!(pairs("f(l[0].into(), l[1].into(), &a, &b)"), [0, 2]);
+        assert_eq!(pairs("f(x, x, true, false)"), Vec::<usize>::new());
     }
 
     #[test]

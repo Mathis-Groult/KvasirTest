@@ -39,8 +39,18 @@ pub enum Genre {
     Literal,
     /// Replace `a && b` or `a || b` with one operand (`--extra-mutants`).
     DropOperand,
+    /// Swap two adjacent call arguments of the same shape (`--extra-mutants`).
+    SwapArgs,
     /// A hand-written textual edit from a `--custom-mutants` spec (added by `KvasirTest`).
     Custom,
+}
+
+impl Genre {
+    /// Kinds whose variant may not type-check (`KvasirTest`): a compiler error inside such a
+    /// mutant's own variant in the schema makes it unviable without a classic build.
+    pub fn may_not_type_check(&self) -> bool {
+        matches!(self, Genre::SwapArgs)
+    }
 }
 
 /// The target of a mutation, providing additional context about what is being mutated.

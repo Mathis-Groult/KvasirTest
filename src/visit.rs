@@ -379,6 +379,47 @@ impl DiscoveryVisitor<'_> {
         }
     }
 
+    /// `--extra-mutants swap-args`: swap adjacent arguments of the same shape in a call.
+    fn collect_arg_swaps(
+        &mut self,
+        args: &syn::punctuated::Punctuated<Expr, syn::Token![,]>,
+        call: proc_macro2::Span,
+    ) {
+        if !self.extra_here(ExtraKind::SwapArgs) {
+            return;
+        }
+        let code = self.source_file.code.clone();
+        let args: Vec<&Expr> = args.iter().collect();
+        for k in extra::swappable_pairs_of(&args) {
+            let (a, b) = (args[k].span(), args[k + 1].span());
+            let piece = |start: proc_macro2::LineColumn, end: proc_macro2::LineColumn| {
+                Span {
+                    start: start.into(),
+                    end: end.into(),
+                }
+                .extract(&code)
+            };
+            let replacement = format!(
+                "{}{}{}",
+                piece(b.start(), b.end()),
+                piece(a.end(), b.start()),
+                piece(a.start(), a.end())
+            );
+            self.collect_mutant_text(
+                Span {
+                    start: a.start().into(),
+                    end: b.end().into(),
+                },
+                replacement,
+                Genre::SwapArgs,
+                Some(Site {
+                    kind: SiteKind::Expr,
+                    span: call.into(),
+                }),
+            );
+        }
+    }
+
     /// [`Self::collect_mutant`] with the replacement already as text.
     fn collect_mutant_text(
         &mut self,
@@ -557,6 +598,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 return;
             }
         }
+        self.collect_arg_swaps(&i.args, i.span());
         syn::visit::visit_expr_call(self, i);
     }
 
@@ -569,6 +611,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("skip method call to {hit}");
             return;
         }
+        self.collect_arg_swaps(&i.args, i.span());
         syn::visit::visit_expr_method_call(self, i);
     }
 

@@ -86,11 +86,15 @@ impl Schema {
     /// The mutants to blame for an error at `range` of the schema text: those of the innermost
     /// region containing it. Empty when the error lies outside every region.
     pub fn blame(&self, range: &Range<usize>) -> &[u32] {
+        self.innermost(range).map_or(&[], |r| r.ids.as_slice())
+    }
+
+    /// The innermost region containing `range`, if any.
+    pub fn innermost(&self, range: &Range<usize>) -> Option<&Region> {
         self.regions
             .iter()
             .filter(|r| r.range.start <= range.start && range.end <= r.range.end)
             .min_by_key(|r| r.range.len())
-            .map_or(&[], |r| r.ids.as_slice())
     }
 }
 
