@@ -521,6 +521,21 @@ fn prepare<'a>(
             blamed = blamed.len()
         );
         if blamed.is_empty() || blamed.is_subset(&out) {
+            // A hand-written edit can break code outside its site (a moved value used later):
+            // take those out before giving up on every mutant.
+            let custom: BTreeSet<usize> = (0..mutants.len())
+                .filter(|i| !out.contains(i) && mutants[*i].genre == crate::Genre::Custom)
+                .collect();
+            if !custom.is_empty() {
+                warn!(
+                    errors = errors.len(),
+                    first = ?errors.first(),
+                    count = custom.len(),
+                    "schema errors not attributable to any mutant; custom mutants go classic"
+                );
+                out.extend(custom);
+                continue;
+            }
             if out.len() == mutants.len() {
                 // The tree does not build even without any mutant: the baseline reports it.
                 break compiled;

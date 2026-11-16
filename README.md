@@ -57,6 +57,19 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   no test reaches is reported missed without running.
 - Mutants run in parallel: CPUs minus 2 by default (`--schema-jobs N`).
 - `--classic` (or `KVASIR_TEST_CLASSIC=1`) gives cargo-mutants' one-build-per-mutant mode.
+- `--custom-mutants spec.toml` adds hand-written mutants to the same build, with the same reach
+  selection and verdicts. Each is a textual edit; `old` must occur exactly once in the file:
+
+  ```toml
+  [[mutant]]
+  name = "swap_xy"                  # unique; shown in results as `custom swap_xy: ...`
+  file = "src/display.rs"           # relative to the workspace root
+  old = "Vec3(t.x, t.y, t.z)"
+  new = "Vec3(t.y, t.x, t.z)"
+  ```
+
+  The switch goes around the smallest enclosing expression or statement list, so the schema runs
+  exactly the edited code. Custom mutants are not subject to `--file`/`--re`/`--exclude`.
 
 Design: [docs/decisions/0001-mutant-schemata.md](docs/decisions/0001-mutant-schemata.md).
 

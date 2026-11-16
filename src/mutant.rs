@@ -33,6 +33,8 @@ pub enum Genre {
     MatchArmGuard,
     /// Delete a field from a struct literal that has a base (default) expression.
     StructField,
+    /// A hand-written textual edit from a `--custom-mutants` spec (added by `KvasirTest`).
+    Custom,
 }
 
 /// The target of a mutation, providing additional context about what is being mutated.
@@ -45,6 +47,8 @@ pub enum MutationTarget {
         /// The name/type of the struct.
         struct_name: String,
     },
+    /// A hand-written mutant, by the name its spec gives it.
+    Custom { name: String },
 }
 
 /// A mutation applied to source code.
@@ -252,6 +256,30 @@ impl Mutant {
                 } else {
                     // Fallback: shouldn't happen with proper initialization
                     v.push(s("delete field from struct expression"));
+                }
+            }
+            Genre::Custom => {
+                if let Some(MutationTarget::Custom { name }) = &self.target {
+                    v.push(s("custom "));
+                    v.push(s(name).bright().magenta());
+                    v.push(s(": "));
+                }
+                let original = self.original_text();
+                let (original, replacement) = (original.trim(), self.replacement.trim());
+                if original.is_empty() {
+                    v.push(s("insert "));
+                    v.push(s(squash_lines(replacement)).bright().yellow());
+                } else {
+                    v.push(s(if replacement.is_empty() {
+                        "delete "
+                    } else {
+                        "replace "
+                    }));
+                    v.push(s(squash_lines(original)).yellow());
+                    if !replacement.is_empty() {
+                        v.push(s(" with "));
+                        v.push(s(squash_lines(replacement)).bright().yellow());
+                    }
                 }
             }
             _ => {

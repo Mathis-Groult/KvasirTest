@@ -17,6 +17,7 @@ mod cargo;
 mod config;
 mod console;
 mod copy_tree;
+mod custom;
 mod exit_code;
 mod fnvalue;
 mod glob;
@@ -391,6 +392,10 @@ pub struct Args {
     #[arg(long, short = 'f', help_heading = "Filters")]
     file: Vec<String>,
 
+    /// Also test the hand-written mutants of this TOML spec (`[[mutant]]` name, file, old, new); repeatable, not subject to the other filters
+    #[arg(long, help_heading = "Generate")]
+    custom_mutants: Vec<Utf8PathBuf>,
+
     /// Include only mutants in code touched by this diff.
     #[arg(long, short = 'D', help_heading = "Filters")]
     in_diff: Option<Utf8PathBuf>,
@@ -649,6 +654,7 @@ fn main() -> Result<ExitCode> {
             }
         };
     }
+    mutants.extend(custom::load(&args.custom_mutants, &workspace)?);
     if let Some(shard) = &args.shard {
         mutants = options.sharding().shard(*shard, mutants);
     }
