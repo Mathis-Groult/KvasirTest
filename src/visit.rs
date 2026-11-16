@@ -328,7 +328,7 @@ impl DiscoveryVisitor<'_> {
         short_replaced: Option<String>,
         replacement: &TokenStream,
         genre: Genre,
-        site: Site,
+        site: Option<Site>,
     ) {
         let mutant = Mutant::new_discovered(
             self.source_file.clone(),
@@ -338,7 +338,7 @@ impl DiscoveryVisitor<'_> {
             replacement.to_pretty_string(),
             genre,
             None,
-            self.schema_site(site),
+            site.and_then(|site| self.schema_site(site)),
         );
         if self.options.allows_mutant(&mutant) {
             self.mutants.push(mutant);
@@ -378,10 +378,10 @@ impl DiscoveryVisitor<'_> {
                             None,
                             &rep,
                             Genre::FnValue,
-                            Site {
+                            Some(Site {
                                 kind: SiteKind::FnBody,
                                 span: body_span,
-                            },
+                            }),
                         );
                     }
                 }
@@ -703,10 +703,12 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 Vec::new()
             }
         };
-        let site = Site {
+        // A `&&` joining `let` conditions (a let-chain) cannot be wrapped in `if .. else`: the
+        // `let` would no longer be a condition, and the bindings it makes would vanish.
+        let site = (!is_let_chain(i)).then(|| Site {
             kind: SiteKind::Expr,
             span: i.span().into(),
-        };
+        });
         for rep in replacements {
             self.collect_mutant(i.op.span().into(), None, &rep, Genre::BinaryOperator, site);
         }
@@ -730,7 +732,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                     None,
                     &quote! {},
                     Genre::UnaryOperator,
-                    site,
+                    Some(site),
                 );
             }
             _ => {
@@ -774,10 +776,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                     Some(arm.pat.to_pretty_string()),
                     &replacement,
                     Genre::MatchArm,
-                    Site {
+                    Some(Site {
                         kind: SiteKind::ArmPattern,
                         span: arm.pat.span().into(),
-                    },
+                    }),
                 );
             }
         } else {
@@ -797,14 +799,14 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                     None,
                     &quote! { true },
                     Genre::MatchArmGuard,
-                    site,
+                    Some(site),
                 );
                 self.collect_mutant(
                     guard_expr.span().into(),
                     None,
                     &quote! { false },
                     Genre::MatchArmGuard,
-                    site,
+                    Some(site),
                 );
             });
 
@@ -866,6 +868,20 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
 
         syn::visit::visit_expr_struct(self, i);
     }
+}
+
+/// True for a `&&` chain with a `let` condition in it (`if let Some(x) = a && x > 1`).
+fn is_let_chain(i: &syn::ExprBinary) -> bool {
+    fn has_let(e: &Expr) -> bool {
+        match e {
+            Expr::Let(_) => true,
+            Expr::Binary(b) if matches!(b.op, BinOp::And(_)) => {
+                has_let(&b.left) || has_let(&b.right)
+            }
+            _ => false,
+        }
+    }
+    matches!(i.op, BinOp::And(_)) && (has_let(&i.left) || has_let(&i.right))
 }
 
 // Get the span of the block excluding the braces, or None if it is empty.
@@ -1287,6 +1303,28 @@ mod test {
             ]
         );
         assert!(mutants.iter().any(|m| m.site.is_none()));
+    }
+
+    #[test]
+    fn let_chain_and_has_no_schema_site_but_its_operands_do() {
+        let code = indoc! { r"
+            fn f(a: Option<u32>, b: u32) -> bool {
+                if let Some(x) = a && x == b { true } else { false }
+            }
+        " };
+        let mutants = mutate_source_str(code, &Options::default()).unwrap();
+        let sites: Vec<(String, bool)> = mutants
+            .iter()
+            .filter(|m| m.genre == Genre::BinaryOperator)
+            .map(|m| (m.describe_change(), m.site.is_some()))
+            .collect();
+        assert_eq!(
+            sites,
+            [
+                ("replace && with || in f".to_owned(), false),
+                ("replace == with != in f".to_owned(), true),
+            ]
+        );
     }
 
     #[test]

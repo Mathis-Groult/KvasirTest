@@ -14,28 +14,28 @@
 //! 5. The original files are restored, then the left-out mutants run one build each.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use itertools::Itertools;
 use jiff::Timestamp;
 use tracing::{debug, error, info, warn};
 
 use crate::build_dir::BuildDir;
-use crate::cargo::cargo_argv;
 use crate::console::Console;
 use crate::lab::{Lab, TestsForMutant, join_threads};
 use crate::options::Options;
 use crate::outcome::{LabOutcome, Phase, PhaseResult, ScenarioOutcome};
-use crate::output::OutputDir;
-use crate::package::{Package, PackageSelection};
+use crate::output::{OutputDir, ScenarioOutput};
+use crate::package::Package;
 use crate::process::Exit;
 use crate::schema::{ACTIVE_MUTANT_VAR, REACH_FILE_VAR, SchemaMutant, parse_reach, render};
-use crate::schema_runner::{TestArgs, Unit, build, list_units};
+use crate::schema_runner::{
+    Compiled, Executable, TestArgs, Unit, build, list_units, parse_executables,
+};
 use crate::timeouts::Timeouts;
 use crate::workspace::Workspace;
 use crate::{Mutant, Result, Scenario};
@@ -65,9 +65,40 @@ pub fn test_mutants(
         console,
     };
 
+    let args = TestArgs::parse(&options.additional_cargo_test_args);
+    let packages = test_packages(&lab.tests_for_mutant, workspace, mutants);
+    let n_workers = schema_jobs(options);
+    let label = build_dir.path();
+    let mut output = lab
+        .output_mutex
+        .lock()
+        .expect("lock output_dir")
+        .start_scenario(&Scenario::Baseline)?;
+    console.scenario_started(label, &Scenario::Baseline, output.open_log_read()?);
+    let mut outcome = ScenarioOutcome::new(&output, Scenario::Baseline);
+
+    // The schema is compiled by the real test build, so the build that accepts it is the one
+    // the baseline and the mutants use.
+    console.scenario_phase_started(label, Phase::Build);
     let prepare_start = Instant::now();
     let compile_time = workspace.compile_time_packages();
-    let prepared = prepare(&build_dir, mutants, &compile_time, options)?;
+    let (prepared, compiled) = prepare(&build_dir, mutants, &compile_time, &mut || {
+        build(
+            build_dir.path(),
+            &packages,
+            &args,
+            options,
+            options.build_timeout,
+            &mut output,
+        )
+    })?;
+    outcome.add_phase_result(PhaseResult {
+        phase: Phase::Build,
+        duration: compiled.duration,
+        process_status: compiled.exit,
+        argv: vec!["cargo".into(), "test".into(), "--no-run".into()],
+    });
+    console.scenario_phase_finished(label, Phase::Build);
     info!(
         in_schema = prepared.active.len(),
         left_out = prepared.left_out.len(),
@@ -76,11 +107,28 @@ pub fn test_mutants(
         "schema ready"
     );
 
-    let args = TestArgs::parse(&options.additional_cargo_test_args);
-    let packages = test_packages(&lab.tests_for_mutant, workspace, mutants);
-    let n_workers = schema_jobs(options);
     let baseline_start = Instant::now();
-    let Some(baseline) = run_baseline(&lab, &build_dir, &packages, &args, n_workers)? else {
+    let baseline = if compiled.exit.is_success() {
+        let executables = if args.only_doc() {
+            Vec::new()
+        } else {
+            parse_executables(&compiled.json)
+        };
+        run_baseline(
+            &lab,
+            &build_dir,
+            &packages,
+            &args,
+            n_workers,
+            &executables,
+            output,
+            outcome,
+        )?
+    } else {
+        finish_baseline(&lab, label, &outcome)?;
+        None
+    };
+    let Some(baseline) = baseline else {
         error!(
             "the schema with no mutant active did not build or pass its tests, so no mutants were tested"
         );
@@ -175,50 +223,30 @@ struct Baseline {
     timeouts: Timeouts,
 }
 
-/// Build the test executables, run every unit once recording its reach; `None` if the build or
-/// any unit failed.
+/// Run every unit of the built executables once, recording its reach; `None` if any failed.
+#[allow(clippy::too_many_arguments)] // the baseline scenario's pieces, built by the caller
 fn run_baseline(
     lab: &Lab<'_>,
     build_dir: &BuildDir,
     packages: &[Arc<Package>],
     args: &TestArgs,
     n_workers: usize,
+    executables: &[Executable],
+    mut output: ScenarioOutput,
+    mut outcome: ScenarioOutcome,
 ) -> Result<Option<Baseline>> {
     let (options, console) = (lab.options, lab.console);
     let label = build_dir.path();
-    let (mut output, reach_dir) = {
-        let mut output_dir = lab.output_mutex.lock().expect("lock output_dir");
-        (
-            output_dir.start_scenario(&Scenario::Baseline)?,
-            output_dir.path().join("reach"),
-        )
-    };
+    let reach_dir = lab
+        .output_mutex
+        .lock()
+        .expect("lock output_dir")
+        .path()
+        .join("reach");
     std::fs::create_dir_all(&reach_dir).context("create reach directory")?;
-    console.scenario_started(label, &Scenario::Baseline, output.open_log_read()?);
-    let mut outcome = ScenarioOutcome::new(&output, Scenario::Baseline);
-
-    console.scenario_phase_started(label, Phase::Build);
-    let (exit, duration, executables) = build(
-        build_dir.path(),
-        packages,
-        args,
-        options,
-        options.build_timeout,
-        &mut output,
-    )?;
-    outcome.add_phase_result(PhaseResult {
-        phase: Phase::Build,
-        duration,
-        process_status: exit,
-        argv: vec!["cargo".into(), "test".into(), "--no-run".into()],
-    });
-    console.scenario_phase_finished(label, Phase::Build);
-    if !exit.is_success() {
-        return finish_baseline(lab, label, &outcome).map(|()| None);
-    }
 
     console.scenario_phase_started(label, Phase::Test);
-    let units = list_units(&executables, packages, args, build_dir.path())?;
+    let units = list_units(executables, packages, args, build_dir.path())?;
     output.message(&format!("{} test units", units.len()))?;
     let results: Mutex<Vec<Option<(Exit, Duration, BTreeSet<u32>)>>> =
         Mutex::new(vec![None; units.len()]);
@@ -414,13 +442,14 @@ impl Drop for Prepared<'_> {
     }
 }
 
-/// Write the schema and take out mutants until `cargo check` accepts it.
+/// Write the schema and take out mutants until the test build accepts it. Returns the schema
+/// and the last build (its exit, total time of all rounds, and JSON messages).
 fn prepare<'a>(
     build_dir: &'a BuildDir,
     mutants: &[Mutant],
     compile_time: &BTreeSet<String>,
-    options: &Options,
-) -> Result<Prepared<'a>> {
+    compile: &mut dyn FnMut() -> Result<Compiled>,
+) -> Result<(Prepared<'a>, Compiled)> {
     let ids: Vec<u32> = (1..=u32::try_from(mutants.len()).context("too many mutants")?).collect();
     let by_file: BTreeMap<Utf8PathBuf, Vec<usize>> = mutants
         .iter()
@@ -428,12 +457,6 @@ fn prepare<'a>(
         .map(|(i, m)| (m.source_file.tree_relative_path.clone(), i))
         .into_group_map()
         .into_iter()
-        .collect();
-    let packages: Vec<Arc<Package>> = mutants
-        .iter()
-        .map(|m| Arc::clone(&m.source_file.package))
-        .sorted_by_key(|p| p.name.clone())
-        .dedup_by(|a, b| a.name == b.name)
         .collect();
     let mut prepared = Prepared {
         build_dir,
@@ -446,14 +469,15 @@ fn prepare<'a>(
         rounds: 0,
         restored: false,
     };
-    // Const contexts and code that runs while compiling are known not to hold a runtime switch:
-    // classic from the start.
+    // Const contexts, let-chains and code that runs while compiling cannot hold a runtime
+    // switch: classic from the start.
     let mut out: BTreeSet<usize> = (0..mutants.len())
         .filter(|&i| {
             mutants[i].site.is_none() || compile_time.contains(&mutants[i].source_file.package.name)
         })
         .collect();
-    loop {
+    let mut total = Duration::ZERO;
+    let compiled = loop {
         prepared.rounds += 1;
         let mut schemas = BTreeMap::new();
         for (path, indexes) in &by_file {
@@ -476,10 +500,12 @@ fn prepare<'a>(
             build_dir.overwrite_file(path, &schema.code)?;
             schemas.insert(path.clone(), schema);
         }
-        let errors = check(build_dir, &packages, options)?;
-        if errors.is_empty() {
-            break;
+        let compiled = compile()?;
+        total += compiled.duration;
+        if compiled.exit.is_success() {
+            break compiled;
         }
+        let errors = parse_errors(&compiled.json, build_dir.path());
         let blamed: BTreeSet<usize> = errors
             .iter()
             .filter_map(|e| schemas.get(&e.file).map(|s| s.blame(&e.range)))
@@ -492,24 +518,32 @@ fn prepare<'a>(
             blamed = blamed.len()
         );
         if blamed.is_empty() || blamed.is_subset(&out) {
+            if out.len() == mutants.len() {
+                // The tree does not build even without any mutant: the baseline reports it.
+                break compiled;
+            }
             warn!(
                 errors = errors.len(),
                 first = ?errors.first(),
                 "schema errors not attributable to any mutant; testing all mutants one build each"
             );
             out.extend(0..mutants.len());
-            prepared.write_originals()?;
-            prepared.restored = false;
-            break;
+            continue;
         }
         out.extend(blamed);
-    }
+    };
     prepared.active = (0..mutants.len())
         .filter(|i| !out.contains(i))
         .map(|i| (ids[i], mutants[i].clone()))
         .collect();
     prepared.left_out = out.iter().map(|&i| mutants[i].clone()).collect();
-    Ok(prepared)
+    Ok((
+        prepared,
+        Compiled {
+            duration: total,
+            ..compiled
+        },
+    ))
 }
 
 /// A compiler error located in a source file of the tree.
@@ -517,33 +551,6 @@ fn prepare<'a>(
 struct CompileError {
     file: Utf8PathBuf,
     range: std::ops::Range<usize>,
-}
-
-/// Run `cargo check --tests` on the packages; return the errors (empty: it compiled).
-fn check(
-    build_dir: &BuildDir,
-    packages: &[Arc<Package>],
-    options: &Options,
-) -> Result<Vec<CompileError>> {
-    let mut argv = cargo_argv(
-        &PackageSelection::Explicit(packages.to_vec()),
-        Phase::Check,
-        options,
-    );
-    argv.push("--message-format=json".to_owned());
-    debug!(?argv, "schema check");
-    let output = Command::new(&argv[0])
-        .args(&argv[1..])
-        .current_dir(build_dir.path())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .with_context(|| format!("run {}", argv.join(" ")))?;
-    let errors = parse_errors(&String::from_utf8_lossy(&output.stdout), build_dir.path());
-    if !output.status.success() && errors.is_empty() {
-        bail!("cargo check failed on the schema without a located error: {argv:?}");
-    }
-    Ok(errors)
 }
 
 /// Primary spans of error-level compiler messages, with paths relative to `root`.

@@ -134,7 +134,7 @@ impl TestArgs {
             .any(|a| TARGET_OPTIONS.contains(&a.split('=').next().unwrap_or(a)))
     }
 
-    fn only_doc(&self) -> bool {
+    pub(crate) fn only_doc(&self) -> bool {
         self.cargo.iter().any(|a| a == "--doc")
     }
 
@@ -280,7 +280,16 @@ pub fn parse_test_list(list: &str) -> Vec<String> {
         .collect()
 }
 
-/// Build the test executables of `packages` once; return the build's exit and the executables.
+/// One test build: its exit, how long it took, and cargo's JSON messages.
+#[derive(Debug)]
+pub struct Compiled {
+    pub exit: Exit,
+    pub duration: Duration,
+    pub json: String,
+}
+
+/// Build the test executables of `packages` (`cargo test --no-run`, JSON messages); compiler
+/// errors are also written, rendered, to the scenario log.
 pub fn build(
     root: &Utf8Path,
     packages: &[Arc<Package>],
@@ -288,7 +297,7 @@ pub fn build(
     options: &Options,
     timeout: Option<Duration>,
     output: &mut ScenarioOutput,
-) -> Result<(Exit, Duration, Vec<Executable>)> {
+) -> Result<Compiled> {
     let start = Instant::now();
     let mut argv = cargo_argv(
         &PackageSelection::Explicit(packages.to_vec()),
@@ -296,7 +305,7 @@ pub fn build(
         options,
     );
     argv.extend(args.cargo.iter().filter(|a| *a != "--doc").cloned());
-    argv.push("--message-format=json-render-diagnostics".to_owned());
+    argv.push("--message-format=json".to_owned());
     output.message(&argv.join(" "))?;
     let json_path = output
         .output_dir
@@ -310,14 +319,21 @@ pub fn build(
         .stderr(output.open_log_append()?)
         .spawn()
         .with_context(|| format!("run {}", argv.join(" ")))?;
-    let status = wait_with_timeout(child, timeout)?;
+    let exit = wait_with_timeout(child, timeout)?;
     let json = std::fs::read_to_string(&json_path).context("read build json")?;
-    let executables = if args.only_doc() {
-        Vec::new()
-    } else {
-        parse_executables(&json)
-    };
-    Ok((status, start.elapsed(), executables))
+    for rendered in json
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["reason"] == "compiler-message" && v["message"]["level"] == "error")
+        .filter_map(|v| v["message"]["rendered"].as_str().map(str::to_owned))
+    {
+        output.message(&rendered)?;
+    }
+    Ok(Compiled {
+        exit,
+        duration: start.elapsed(),
+        json,
+    })
 }
 
 fn wait_with_timeout(mut child: std::process::Child, timeout: Option<Duration>) -> Result<Exit> {
