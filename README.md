@@ -91,6 +91,11 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   `delete self.x.write_nbt(..)` in callers). Name formats: `replace <fn> -> <type> with <value>`
   for whole bodies, `<change> in <fn>` otherwise, with `<fn>` as `Type<generics>::method`,
   `<impl Trait for Type>::method`, `module::free_fn`; closures belong to the function they are in.
+- `kvasir-test compare OLD NEW` compares two runs across a refactor (a function split, code
+  moved): mutants are paired by their mutated source (`mutants.out/sources.json`, written by
+  every run), not by name or line, and it lists each pair whose verdict changed, each old mutant
+  with no counterpart (that code changed shape) and the new mutants not caught. Exit 2 if a
+  caught mutant is no longer caught or a viable one disappeared.
 - Flaky tests: a test that fails (not a timeout) in the baseline is run again up to 2 times;
   passing on a retry reports it `FLAKY` instead of failing the run, and under a mutant that test
   catches it only if it fails every attempt.

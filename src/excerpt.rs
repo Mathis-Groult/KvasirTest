@@ -18,6 +18,11 @@ const MAX_CHARS: usize = 400;
 /// The lines a mutant touches, with the mutation applied, on one line; `None` when the name says
 /// it all (a whole function body replaced).
 pub fn excerpt(mutant: &Mutant) -> Option<String> {
+    excerpt_of(mutant, true)
+}
+
+/// [`excerpt`], extended to the enclosing statement only if `whole_statement`.
+fn excerpt_of(mutant: &Mutant, whole_statement: bool) -> Option<String> {
     let code = mutant.source_file.code();
     let index = LineIndex::new(code);
     let byte = |at: LineColumn| index.offset(code, at);
@@ -33,9 +38,13 @@ pub fn excerpt(mutant: &Mutant) -> Option<String> {
     let (from, to) = group.unwrap_or((edit_start, edit_end));
     // Show the whole statement around the site: an inner site alone (`(a && b)`) hides the rest
     // of the condition it is grouped into.
-    let (from, to) = enclosing_statement(code, &index, from..to)
-        .filter(|r| line_of(code, r.end) - line_of(code, r.start) < MAX_LINES)
-        .map_or((from, to), |r| (r.start.min(from), r.end.max(to)));
+    let (from, to) = if whole_statement {
+        enclosing_statement(code, &index, from..to)
+            .filter(|r| line_of(code, r.end) - line_of(code, r.start) < MAX_LINES)
+            .map_or((from, to), |r| (r.start.min(from), r.end.max(to)))
+    } else {
+        (from, to)
+    };
     let first_line = mutant.span.start.line.min(line_of(code, from));
     let last_line = mutant.span.end.line.max(line_of(code, to));
     let lines = Span {
@@ -80,6 +89,18 @@ pub fn excerpt(mutant: &Mutant) -> Option<String> {
     } else {
         squashed
     })
+}
+
+/// The text that identifies a mutant across a refactor that moves code: the lines of its site
+/// with the mutation applied (not the whole statement: a split shortens the `if` or `match` a
+/// site sits in, which must not change the key), or for a deletion that leaves nothing to show,
+/// the deleted text. `None` for whole-body replacements, which belong to their function.
+pub fn source_key(mutant: &Mutant) -> Option<String> {
+    if mutant.genre == crate::Genre::FnValue {
+        return None;
+    }
+    excerpt_of(mutant, false)
+        .or_else(|| Some(format!("delete {}", squash(&mutant.original_text()))))
 }
 
 /// Statements longer than this many lines are not shown whole.

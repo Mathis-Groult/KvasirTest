@@ -14,6 +14,7 @@
 mod annotation;
 mod build_dir;
 mod cargo;
+mod compare;
 mod config;
 mod console;
 mod copy_tree;
@@ -130,6 +131,9 @@ enum Cargo {
     /// Run only the tests a change can reach.
     #[command(name = "test", styles(clap_styles()))]
     Test(test_mode::TestModeArgs),
+    /// Compare two mutation runs across a refactor.
+    #[command(name = "compare", styles(clap_styles()))]
+    Compare(compare::CompareArgs),
 }
 
 #[derive(Debug, Default, ValueEnum, Clone, Copy, Eq, PartialEq)]
@@ -547,6 +551,12 @@ pub struct Args {
 fn main() -> Result<ExitCode> {
     let args = match Cargo::try_parse() {
         Ok(Cargo::Mutants(args)) => args,
+        Ok(Cargo::Compare(compare_args)) => {
+            return compare::run(&compare_args).or_else(|err| {
+                eprintln!("Error: {err:?}");
+                Ok(ExitCode::Software)
+            });
+        }
         Ok(Cargo::Test(test_args)) => {
             interrupt::install_handler();
             return test_mode::run(&test_args).or_else(|err| {
@@ -685,6 +695,16 @@ fn main() -> Result<ExitCode> {
         Ok(ExitCode::Success)
     } else {
         let output_dir = OutputDir::new(&output_parent_dir)?;
+        // For `kvasir-test compare`: each mutant's mutated source, its identity across refactors.
+        let sources: std::collections::BTreeMap<&str, String> = mutants
+            .iter()
+            .filter_map(|m| excerpt::source_key(m).map(|k| (m.name.as_str(), k)))
+            .collect();
+        std::fs::write(
+            output_dir.path().join(compare::SOURCES_JSON),
+            serde_json::to_string_pretty(&sources)?,
+        )
+        .context("write sources.json")?;
         if !equivalent.is_empty() {
             let mut text = String::new();
             for e in &equivalent {
