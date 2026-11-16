@@ -793,6 +793,9 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             // because they require parenthesis for disambiguation in many expressions.
             BinOp::Eq(_) => vec![quote! { != }],
             BinOp::Ne(_) => vec![quote! { == }],
+            // In a let-chain (`if let P = a && b`), `||` never compiles: rustc accepts `let`
+            // conditions only joined by `&&`. Each such mutant cost a classic build to learn it.
+            BinOp::And(_) if is_let_chain(i) => Vec::new(),
             BinOp::And(_) => vec![quote! { || }],
             BinOp::Or(_) => vec![quote! { && }],
             BinOp::Lt(_) => vec![quote! { == }, quote! {>}, quote! { <= }],
@@ -1451,7 +1454,7 @@ mod test {
     }
 
     #[test]
-    fn let_chain_and_has_no_schema_site_but_its_operands_do() {
+    fn let_chain_and_is_not_mutated_but_its_operands_are() {
         let code = indoc! { r"
             fn f(a: Option<u32>, b: u32) -> bool {
                 if let Some(x) = a && x == b { true } else { false }
@@ -1463,13 +1466,7 @@ mod test {
             .filter(|m| m.genre == Genre::BinaryOperator)
             .map(|m| (m.describe_change(), m.site.is_some()))
             .collect();
-        assert_eq!(
-            sites,
-            [
-                ("replace && with || in f".to_owned(), false),
-                ("replace == with != in f".to_owned(), true),
-            ]
-        );
+        assert_eq!(sites, [("replace == with != in f".to_owned(), true)]);
     }
 
     #[test]
