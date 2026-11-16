@@ -25,6 +25,7 @@ mod interrupt;
 mod lab;
 mod list;
 mod manifest;
+mod mirror;
 mod mutant;
 mod options;
 mod outcome;
@@ -32,7 +33,9 @@ mod output;
 mod package;
 mod path;
 mod pretty;
+mod probe;
 mod process;
+mod reach_map;
 mod scenario;
 mod schema;
 mod schema_lab;
@@ -41,6 +44,7 @@ mod shard;
 mod source;
 mod span;
 mod tail_file;
+mod test_mode;
 #[cfg(test)]
 #[path = "../tests/util/mod.rs"]
 mod test_util;
@@ -108,6 +112,9 @@ fn clap_styles() -> Styles {
 enum Cargo {
     #[command(name = "mutants", styles(clap_styles()))]
     Mutants(Args),
+    /// Run only the tests a change can reach (KvasirTest).
+    #[command(name = "test", styles(clap_styles()))]
+    Test(test_mode::TestModeArgs),
 }
 
 #[derive(Debug, Default, ValueEnum, Clone, Copy, Eq, PartialEq)]
@@ -507,6 +514,13 @@ pub struct Args {
 fn main() -> Result<ExitCode> {
     let args = match Cargo::try_parse() {
         Ok(Cargo::Mutants(args)) => args,
+        Ok(Cargo::Test(test_args)) => {
+            interrupt::install_handler();
+            return test_mode::run(&test_args).or_else(|err| {
+                eprintln!("Error: {err:?}");
+                Ok(ExitCode::Software)
+            });
+        }
         Err(e) => {
             e.print().expect("Failed to show clap error message");
             // Clap by default exits with code 2.

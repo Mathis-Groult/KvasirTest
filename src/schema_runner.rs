@@ -149,6 +149,8 @@ pub enum UnitKind {
     /// One test of a test executable.
     Test {
         executable: Utf8PathBuf,
+        /// `kind:name` of the cargo target.
+        target: String,
         name: String,
     },
     /// All doc tests of a package (through `cargo test --doc`).
@@ -165,19 +167,33 @@ pub struct Unit {
 }
 
 impl Unit {
+    /// A stable key: `package/kind:target/test name`, or `package/doc tests`.
+    pub fn key(&self) -> String {
+        match &self.kind {
+            UnitKind::Test { target, name, .. } => {
+                format!("{}/{target}/{name}", self.package.name)
+            }
+            UnitKind::DocTests => format!("{}/doc tests", self.package.name),
+        }
+    }
+
     /// A short name for logs.
     pub fn label(&self) -> String {
         match &self.kind {
-            UnitKind::Test { executable, name } => {
+            UnitKind::Test {
+                executable, name, ..
+            } => {
                 format!("{} {name}", executable.file_name().unwrap_or_default())
             }
             UnitKind::DocTests => format!("doc tests of {}", self.package.name),
         }
     }
 
-    fn argv(&self, test_args: &TestArgs, options: &Options) -> Vec<String> {
+    pub(crate) fn argv(&self, test_args: &TestArgs, options: &Options) -> Vec<String> {
         match &self.kind {
-            UnitKind::Test { executable, name } => {
+            UnitKind::Test {
+                executable, name, ..
+            } => {
                 let mut argv = vec![executable.to_string(), "--exact".to_owned(), name.clone()];
                 argv.extend(test_args.harness.iter().cloned());
                 argv
@@ -200,7 +216,7 @@ impl Unit {
         }
     }
 
-    fn env(&self) -> Vec<(String, String)> {
+    pub(crate) fn env(&self) -> Vec<(String, String)> {
         let mut env = vec![
             ("INSTA_UPDATE".to_owned(), "no".to_owned()),
             ("INSTA_FORCE_PASS".to_owned(), "0".to_owned()),
@@ -251,7 +267,8 @@ impl Unit {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Executable {
     pub path: Utf8PathBuf,
-    pub package_name: String,
+    /// `kind:name` of the cargo target (stable, unlike the hashed file name).
+    pub target: String,
     pub cwd: Utf8PathBuf,
 }
 
@@ -265,7 +282,11 @@ pub fn parse_executables(json_lines: &str) -> Vec<Executable> {
             let manifest = Utf8PathBuf::from(v["manifest_path"].as_str()?);
             Some(Executable {
                 path: Utf8PathBuf::from(v["executable"].as_str()?),
-                package_name: v["target"]["name"].as_str().map(str::to_owned)?,
+                target: format!(
+                    "{}:{}",
+                    v["target"]["kind"][0].as_str()?,
+                    v["target"]["name"].as_str()?
+                ),
                 cwd: manifest.parent()?.to_owned(),
             })
         })
@@ -288,15 +309,64 @@ pub struct Compiled {
     pub json: String,
 }
 
+/// Where a build writes its log: a mutation scenario's log, or a plain file in `test` mode.
+pub trait BuildLog {
+    fn message(&mut self, text: &str) -> Result<()>;
+    /// A handle appending to the log (for the child's stderr).
+    fn append(&self) -> Result<std::fs::File>;
+    /// Where to keep cargo's JSON messages.
+    fn json_path(&self) -> Utf8PathBuf;
+}
+
+impl BuildLog for ScenarioOutput {
+    fn message(&mut self, text: &str) -> Result<()> {
+        ScenarioOutput::message(self, text)
+    }
+
+    fn append(&self) -> Result<std::fs::File> {
+        self.open_log_append()
+    }
+
+    fn json_path(&self) -> Utf8PathBuf {
+        self.output_dir
+            .join(self.log_path())
+            .with_extension("build.json")
+    }
+}
+
+/// A plain log file.
+pub struct FileLog(pub Utf8PathBuf);
+
+impl BuildLog for FileLog {
+    fn message(&mut self, text: &str) -> Result<()> {
+        use std::io::Write as _;
+        writeln!(self.append()?, "{text}").context("write log")
+    }
+
+    fn append(&self) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.0)
+            .with_context(|| format!("open {}", self.0))
+    }
+
+    fn json_path(&self) -> Utf8PathBuf {
+        self.0.with_extension("json")
+    }
+}
+
 /// Build the test executables of `packages` (`cargo test --no-run`, JSON messages); compiler
-/// errors are also written, rendered, to the scenario log.
+/// errors are also written, rendered, to the log.
+#[allow(clippy::too_many_arguments)] // the build's inputs, each needed
 pub fn build(
     root: &Utf8Path,
     packages: &[Arc<Package>],
     test_args: &TestArgs,
     options: &Options,
     timeout: Option<Duration>,
-    output: &mut ScenarioOutput,
+    env: &[(String, String)],
+    output: &mut dyn BuildLog,
 ) -> Result<Compiled> {
     let start = Instant::now();
     let mut argv = cargo_argv(
@@ -307,16 +377,14 @@ pub fn build(
     argv.extend(test_args.cargo.iter().filter(|a| *a != "--doc").cloned());
     argv.push("--message-format=json".to_owned());
     output.message(&argv.join(" "))?;
-    let json_path = output
-        .output_dir
-        .join(output.log_path())
-        .with_extension("build.json");
+    let json_path = output.json_path();
     let child = Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(&json_path).context("create build json log")?)
-        .stderr(output.open_log_append()?)
+        .stderr(output.append()?)
         .spawn()
         .with_context(|| format!("run {}", argv.join(" ")))?;
     let exit = wait_with_timeout(child, timeout)?;
@@ -378,6 +446,7 @@ pub fn list_units(
         units.extend(names.into_iter().map(|name| Unit {
             kind: UnitKind::Test {
                 executable: exe.path.clone(),
+                target: exe.target.clone(),
                 name,
             },
             package: Arc::clone(&package),
@@ -513,13 +582,13 @@ mod test {
     #[test]
     fn executables_come_from_test_profile_artifacts() {
         let json = r#"{"reason":"compiler-artifact","profile":{"test":false},"executable":null,"manifest_path":"/w/Cargo.toml","target":{"name":"dep"}}
-{"reason":"compiler-artifact","profile":{"test":true},"executable":"/w/target/debug/deps/x-1","manifest_path":"/w/x/Cargo.toml","target":{"name":"x"}}
+{"reason":"compiler-artifact","profile":{"test":true},"executable":"/w/target/debug/deps/x-1","manifest_path":"/w/x/Cargo.toml","target":{"name":"x","kind":["lib"]}}
 {"reason":"build-finished","success":true}"#;
         assert_eq!(
             parse_executables(json),
             vec![Executable {
                 path: "/w/target/debug/deps/x-1".into(),
-                package_name: "x".into(),
+                target: "lib:x".into(),
                 cwd: "/w/x".into(),
             }]
         );

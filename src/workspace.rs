@@ -112,6 +112,11 @@ impl Workspace {
         Ok(Workspace { metadata, packages })
     }
 
+    /// Cargo's target directory for this workspace.
+    pub fn target_directory(&self) -> &Utf8Path {
+        &self.metadata.target_directory
+    }
+
     /// All packages of the workspace.
     pub fn packages(&self) -> &[Arc<Package>] {
         &self.packages

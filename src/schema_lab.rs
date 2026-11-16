@@ -89,6 +89,7 @@ pub fn test_mutants(
             &args,
             options,
             options.build_timeout,
+            &[],
             &mut output,
         )
     })?;

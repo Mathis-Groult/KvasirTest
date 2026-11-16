@@ -333,13 +333,13 @@ impl Renderer<'_> {
 }
 
 /// Converts the (line, char column) positions of [`Span`] into byte offsets.
-struct LineIndex {
+pub(crate) struct LineIndex {
     /// Byte offset of the start of each line (index 0 = line 1).
     starts: Vec<usize>,
 }
 
 impl LineIndex {
-    fn new(code: &str) -> Self {
+    pub(crate) fn new(code: &str) -> Self {
         let mut starts = vec![0];
         starts.extend(code.match_indices('\n').map(|(i, _)| i + 1));
         LineIndex { starts }
@@ -347,7 +347,7 @@ impl LineIndex {
 
     /// Byte offset of a position, counting columns in chars and not counting `\r` (as
     /// [`Span::extract`] does). A column one past the end of the line is the line end.
-    fn offset(&self, code: &str, at: LineColumn) -> Option<usize> {
+    pub(crate) fn offset(&self, code: &str, at: LineColumn) -> Option<usize> {
         let line_start = *self.starts.get(at.line.checked_sub(1)?)?;
         let line_end = self.starts.get(at.line).map_or(code.len(), |&s| s);
         let line = &code[line_start..line_end];
