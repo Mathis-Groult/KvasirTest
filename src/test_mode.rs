@@ -19,13 +19,13 @@ use itertools::Itertools;
 
 use crate::Result;
 use crate::exit_code::ExitCode;
-use crate::mirror::sync;
+use crate::mirror::{SyncCache, sync};
 use crate::options::Options;
 use crate::package::Package;
-use crate::probe::fnv64;
+use crate::probe::{fnv64, parse_probe_ids};
 use crate::process::Exit;
 use crate::reach_map::{MAP_VERSION, Plan, ReachMap, Snapshot, TestEntry, plan, select};
-use crate::schema::{REACH_FILE_VAR, parse_reach};
+use crate::schema::REACH_FILE_VAR;
 use crate::schema_runner::{FileLog, TestArgs, Unit, build, list_units, parse_executables};
 use crate::workspace::Workspace;
 
@@ -66,7 +66,7 @@ pub struct TestModeArgs {
 struct Ran {
     exit: Exit,
     duration: Duration,
-    reach: BTreeSet<u32>,
+    reach: BTreeSet<u64>,
 }
 
 pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
@@ -106,7 +106,13 @@ pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
         .map(|t| vec![t.to_owned()])
         .unwrap_or_default();
     let sync_start = Instant::now();
-    let synced = sync(&root, &mirror, &instrumented, &skip)?;
+    let cache_path = state.join("sync-cache.json");
+    let mut cache: SyncCache = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let synced = sync(&root, &mirror, &instrumented, &skip, &mut cache)?;
+    fs::write(&cache_path, serde_json::to_string(&cache)?).context("write sync cache")?;
     let snapshot = Snapshot {
         scope: format!(
             "packages={} args={}",
@@ -138,8 +144,9 @@ pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
         }
     }
     println!(
-        "Mirror synced in {:.1}s ({} file(s) rewritten).",
+        "Mirror synced in {:.1}s ({} file(s) read, {} rewritten).",
         sync_start.elapsed().as_secs_f64(),
+        synced.read,
         synced.written
     );
 
@@ -238,7 +245,7 @@ pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
                 reach: ran
                     .reach
                     .iter()
-                    .filter_map(|&id| synced.probes.get(id as usize - 1).cloned())
+                    .filter_map(|id| synced.probes.get(id).cloned())
                     .collect(),
                 seconds: ran.duration.as_secs_f64(),
                 passed: ran.exit.is_success(),
@@ -396,7 +403,7 @@ fn run_one(
         thread::sleep(Duration::from_millis(10));
     };
     let reach = fs::read_to_string(&reach_file)
-        .map(|t| parse_reach(&t))
+        .map(|t| parse_probe_ids(&t))
         .unwrap_or_default();
     fs::remove_file(&reach_file).ok();
     Ok(Ran {

@@ -42,7 +42,7 @@ pub fn fnv64(bytes: &[u8]) -> u64 {
 /// The probe statement for function `id`: when [`REACH_FILE_VAR`] names a file, the first call
 /// in the process appends the id to it. Afterwards (or when not recording) it costs one atomic
 /// load. Written for every edition and without imports.
-pub fn probe(id: u32) -> String {
+pub fn probe(id: u64) -> String {
     format!(
         "{{ static KVASIR_TEST_PROBE: ::std::sync::atomic::AtomicBool = \
          ::std::sync::atomic::AtomicBool::new(false); \
@@ -52,6 +52,11 @@ pub fn probe(id: u32) -> String {
          if let Ok(mut file) = ::std::fs::OpenOptions::new().create(true).append(true).open(path) {{ \
          let _ = ::std::io::Write::write_all(&mut file, b\"{id}\\n\"); }} }} }} }} "
     )
+}
+
+/// Probe ids in a reach file written by probes (one per line; others are ignored).
+pub fn parse_probe_ids(text: &str) -> std::collections::BTreeSet<u64> {
+    text.lines().filter_map(|l| l.trim().parse().ok()).collect()
 }
 
 /// Find the probe-able functions of `code` (the file at `rel_path`).
@@ -74,8 +79,8 @@ pub fn analyse(rel_path: &str, code: &str) -> Result<FileFns, syn::Error> {
 }
 
 /// `code` with the probe for `ids[i]` inserted into function `fns[i]`.
-pub fn instrument(code: &str, fns: &[FnInfo], ids: &[u32]) -> String {
-    let mut at: Vec<(usize, u32)> = fns
+pub fn instrument(code: &str, fns: &[FnInfo], ids: &[u64]) -> String {
+    let mut at: Vec<(usize, u64)> = fns
         .iter()
         .map(|f| f.probe_at)
         .zip(ids.iter().copied())
