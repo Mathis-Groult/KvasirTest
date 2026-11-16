@@ -82,6 +82,12 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
 - A MISSED line also prints the mutated source (`mutated: let x = (a && b || c) && d;`): the
   statement it sits in with the mutation applied and the mutated expression in parentheses, so the
   grouping the compiler sees is explicit. The same text is `mutated_source` in `outcomes.json`.
+- Known equivalent mutants go in `.cargo/mutants-equivalent.toml` (or `--equivalent FILE`):
+  `[[equivalent]] name = "<name as printed, :line:col optional>"`, `reason = ".."`, optional
+  `line = N` when the name repeats in one function. They are not tested, print as `EQUIV` with
+  the reason (also `mutants.out/equivalent.txt`) and do not count as missed or set the exit
+  code. Matching ignores the location, so entries survive code moving; an entry that matches
+  nothing in a run covering its file is a warning.
 
 Design: [docs/decisions/0001-mutant-schemata.md](docs/decisions/0001-mutant-schemata.md).
 

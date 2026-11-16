@@ -18,6 +18,7 @@ mod config;
 mod console;
 mod copy_tree;
 mod custom;
+mod equivalent;
 mod excerpt;
 mod exit_code;
 mod extra;
@@ -398,6 +399,10 @@ pub struct Args {
     #[arg(long, value_enum, value_delimiter = ',', help_heading = "Generate")]
     extra_mutants: Vec<extra::ExtraKind>,
 
+    /// Known equivalent mutants (TOML `[[equivalent]]` name, reason): not tested, shown as EQUIV, not counted as missed; default .cargo/mutants-equivalent.toml in the workspace
+    #[arg(long, help_heading = "Filters")]
+    equivalent: Option<Utf8PathBuf>,
+
     /// Also test the hand-written mutants of this TOML spec (`[[mutant]]` name, file, old, new); repeatable, not subject to the other filters
     #[arg(long, help_heading = "Generate")]
     custom_mutants: Vec<Utf8PathBuf>,
@@ -661,6 +666,11 @@ fn main() -> Result<ExitCode> {
         };
     }
     mutants.extend(custom::load(&args.custom_mutants, &workspace)?);
+    let name_filtered = !args.examine_re.is_empty() || !args.exclude_re.is_empty();
+    let (kept, equivalent) =
+        equivalent::Equivalents::load(args.equivalent.as_deref(), workspace.root())?
+            .split(mutants, name_filtered);
+    mutants = kept;
     if let Some(shard) = &args.shard {
         mutants = options.sharding().shard(*shard, mutants);
     }
@@ -669,6 +679,20 @@ fn main() -> Result<ExitCode> {
         Ok(ExitCode::Success)
     } else {
         let output_dir = OutputDir::new(&output_parent_dir)?;
+        if !equivalent.is_empty() {
+            let mut text = String::new();
+            for e in &equivalent {
+                console.message(&format!(
+                    "{:8} {} ({})\n",
+                    ::console::style("EQUIV").cyan(),
+                    e.mutant.name(options.show_line_col),
+                    e.reason
+                ));
+                text.push_str(&format!("{}\t{}\n", e.mutant.name(true), e.reason));
+            }
+            std::fs::write(output_dir.path().join("equivalent.txt"), text)
+                .context("write equivalent.txt")?;
+        }
         if let Some(previously_caught) = previously_caught {
             output_dir.write_previously_caught(&previously_caught)?;
         }
