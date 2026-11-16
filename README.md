@@ -91,6 +91,9 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   `delete self.x.write_nbt(..)` in callers). Name formats: `replace <fn> -> <type> with <value>`
   for whole bodies, `<change> in <fn>` otherwise, with `<fn>` as `Type<generics>::method`,
   `<impl Trait for Type>::method`, `module::free_fn`; closures belong to the function they are in.
+- Flaky tests: a test that fails (not a timeout) in the baseline is run again up to 2 times;
+  passing on a retry reports it `FLAKY` instead of failing the run, and under a mutant that test
+  catches it only if it fails every attempt.
 - Known equivalent mutants go in `.cargo/mutants-equivalent.toml` (or `--equivalent FILE`):
   `[[equivalent]] name = "<name as printed, :line:col optional>"`, `reason = ".."`, optional
   `line = N` when the name repeats in one function. They are not tested, print as `EQUIV` with
@@ -113,6 +116,8 @@ kvasir-test test -p my-crate -- --lib
   run re-records what it ran, so the record stays exact.
 - Any change outside function bodies (types, constants, manifests, data or golden files, the
   toolchain) runs everything. `--full` forces it; `--plan` shows what would run.
+- A failing test is run again up to 2 times; passing on a retry prints `FLAKY` (with the failing
+  log) instead of failing the run.
 
 Your source tree is never edited. Design:
 [docs/decisions/0002-test-mode-reach-map.md](docs/decisions/0002-test-mode-reach-map.md).

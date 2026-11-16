@@ -38,6 +38,7 @@ use crate::schema::{
 use crate::schema_runner::{
     Compiled, Executable, TestArgs, Unit, build, list_units, parse_executables,
 };
+use crate::test_mode::FLAKY_RETRIES;
 use crate::timeouts::Timeouts;
 use crate::workspace::Workspace;
 use crate::{Mutant, Result, Scenario};
@@ -222,14 +223,17 @@ fn test_packages(
     }
 }
 
-/// One unit's baseline run: its exit, its time, and the mutants it reaches.
-type UnitBaseline = (Exit, Duration, BTreeSet<u32>);
+/// One unit's baseline run: its exit, its time, the mutants it reaches, and whether it failed
+/// before passing on a retry (flaky).
+type UnitBaseline = (Exit, Duration, BTreeSet<u32>, bool);
 
 /// The baseline: every unit, its time with no mutant active, and the mutants it reaches.
 struct Baseline {
     units: Vec<Unit>,
     durations: Vec<Duration>,
     reach: Vec<BTreeSet<u32>>,
+    /// Units that failed and then passed in the baseline: a failure under a mutant is retried.
+    flaky: Vec<bool>,
     timeouts: Timeouts,
 }
 
@@ -276,13 +280,34 @@ fn run_baseline(
                         };
                         let reach_file = reach_dir.join(format!("unit-{i}"));
                         let env = [(REACH_FILE_VAR.to_owned(), reach_file.to_string())];
-                        let (exit, duration) =
+                        let (mut exit, mut duration) =
                             unit.run(args, options, &env, options.test_timeout, &mut log, console)?;
+                        let mut failed = 0;
+                        while failed < FLAKY_RETRIES && !exit.is_success() && !exit.is_timeout() {
+                            failed += 1;
+                            std::fs::remove_file(&reach_file).ok();
+                            (exit, duration) = unit.run(
+                                args,
+                                options,
+                                &env,
+                                options.test_timeout,
+                                &mut log,
+                                console,
+                            )?;
+                        }
+                        let flaky = failed > 0 && exit.is_success();
+                        if flaky {
+                            warn!(
+                                unit = unit.label(),
+                                failed, "flaky in the baseline: failed, then passed on a retry"
+                            );
+                        }
                         let reach = std::fs::read_to_string(&reach_file)
                             .map(|t| parse_reach(&t))
                             .unwrap_or_default();
                         std::fs::remove_file(&reach_file).ok();
-                        results.lock().expect("lock results")[i] = Some((exit, duration, reach));
+                        results.lock().expect("lock results")[i] =
+                            Some((exit, duration, reach, flaky));
                     }
                 })
             })
@@ -293,8 +318,16 @@ fn run_baseline(
     let mut status = Exit::Success;
     let mut durations = Vec::with_capacity(units.len());
     let mut reach = Vec::with_capacity(units.len());
+    let mut flaky = Vec::with_capacity(units.len());
     for (unit, result) in units.iter().zip(results) {
-        let (exit, duration, unit_reach) = result.expect("every unit ran");
+        let (exit, duration, unit_reach, unit_flaky) = result.expect("every unit ran");
+        if unit_flaky {
+            output.message(&format!(
+                "FLAKY in baseline: {} (passed on a retry)",
+                unit.label()
+            ))?;
+        }
+        flaky.push(unit_flaky);
         if !exit.is_success() {
             output.message(&format!("FAILED in baseline: {} ({exit:?})", unit.label()))?;
             if status.is_success() || exit.is_timeout() {
@@ -321,6 +354,7 @@ fn run_baseline(
         units,
         durations,
         reach,
+        flaky,
     }))
 }
 
@@ -382,9 +416,22 @@ fn run_schema_mutant(
                 .ceil(),
             ))
         });
-        let (exit, duration) =
+        let (mut exit, duration) =
             baseline.units[i].run(args, options, &env, Some(timeout), &mut output, console)?;
         total += duration;
+        // A unit flaky in the baseline catches the mutant only if it fails every attempt.
+        let mut retries = 0;
+        while baseline.flaky[i] && retries < FLAKY_RETRIES && exit.is_failure() {
+            retries += 1;
+            output.message(&format!(
+                "retry {retries} of flaky {}",
+                baseline.units[i].label()
+            ))?;
+            let (again, duration) =
+                baseline.units[i].run(args, options, &env, Some(timeout), &mut output, console)?;
+            total += duration;
+            exit = again;
+        }
         if !exit.is_success() {
             status = exit;
             break;

@@ -67,7 +67,13 @@ struct Ran {
     exit: Exit,
     duration: Duration,
     reach: BTreeSet<u64>,
+    /// Failed attempts before this (passing) one: a flaky test.
+    failed_attempts: usize,
 }
+
+/// A failing test (not a timeout) is run again up to this many times; passing on a retry
+/// reports it as flaky instead of failed (a test that fails under host load once).
+pub const FLAKY_RETRIES: usize = 2;
 
 pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
     let start = Instant::now();
@@ -235,9 +241,12 @@ pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
     new_map.files = snapshot.files;
     new_map.tests.retain(|k, _| keys.contains(k));
     let mut failed = Vec::new();
+    let mut flaky = Vec::new();
     for (&i, ran) in to_run.iter().zip(&results) {
         if !ran.exit.is_success() {
             failed.push((keys[i].clone(), ran.exit));
+        } else if ran.failed_attempts > 0 {
+            flaky.push((keys[i].clone(), ran.failed_attempts));
         }
         new_map.tests.insert(
             keys[i].clone(),
@@ -257,15 +266,26 @@ pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
     fs::rename(&tmp, &map_path).context("replace reach map")?;
 
     println!(
-        "Ran {} of {} tests in {:.1}s ({} worker(s)): {} passed, {} failed. Total {:.1}s.",
+        "Ran {} of {} tests in {:.1}s ({} worker(s)): {} passed{}, {} failed. Total {:.1}s.",
         to_run.len(),
         units.len(),
         run_time.as_secs_f64(),
         workers,
         to_run.len() - failed.len(),
+        if flaky.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} flaky)", flaky.len())
+        },
         failed.len(),
         start.elapsed().as_secs_f64()
     );
+    for (key, attempts) in &flaky {
+        println!(
+            "FLAKY {key}: failed {attempts} time(s), then passed; failing log: {}",
+            log_path(&logs, key).with_extension("attempt1.log")
+        );
+    }
     if to_run.is_empty() {
         println!("No test reaches the changed code.");
     }
@@ -337,14 +357,22 @@ fn run_units(
                         let timeout = map
                             .and_then(|m| m.tests.get(&keys[i]))
                             .map(|t| Duration::from_secs_f64((t.seconds * 10.0).max(60.0)));
-                        let ran = run_one(
-                            &units[i],
-                            test_args,
-                            options,
-                            env,
-                            &log_path(logs, &keys[i]),
-                            timeout,
-                        )?;
+                        let log = log_path(logs, &keys[i]);
+                        let mut ran = run_one(&units[i], test_args, options, env, &log, timeout)?;
+                        let mut failed = 0;
+                        while failed < FLAKY_RETRIES
+                            && !ran.exit.is_success()
+                            && !ran.exit.is_timeout()
+                        {
+                            failed += 1;
+                            // Keep the failing log next to the retry's.
+                            fs::rename(&log, log.with_extension(format!("attempt{failed}.log")))
+                                .ok();
+                            ran = run_one(&units[i], test_args, options, env, &log, timeout)?;
+                        }
+                        if ran.exit.is_success() {
+                            ran.failed_attempts = failed;
+                        }
                         results.lock().expect("lock results")[slot] = Some(ran);
                     }
                 })
@@ -410,5 +438,6 @@ fn run_one(
         exit,
         duration: start.elapsed(),
         reach,
+        failed_attempts: 0,
     })
 }
