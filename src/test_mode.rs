@@ -261,6 +261,13 @@ pub fn run(args: &TestModeArgs) -> Result<ExitCode> {
             },
         );
     }
+    crate::durations::record(
+        &crate::durations::path(&target_dir),
+        to_run
+            .iter()
+            .zip(&results)
+            .map(|(&i, ran)| (keys[i].clone(), ran.duration.as_secs_f64())),
+    );
     let tmp = map_path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_string(&new_map)?).context("write reach map")?;
     fs::rename(&tmp, &map_path).context("replace reach map")?;

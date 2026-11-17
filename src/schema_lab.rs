@@ -125,6 +125,7 @@ pub fn test_mutants(
             &args,
             n_workers,
             &executables,
+            &crate::durations::path(workspace.target_directory()),
             output,
             outcome,
         )?
@@ -243,6 +244,18 @@ struct Baseline {
     timeouts: Timeouts,
 }
 
+/// The order to start units in: longest known first, units with no recorded time before them
+/// (they may be long), ties in listing order. The baseline's wall time is bounded below by its
+/// longest unit, so starting that one last (listing order) wasted up to a minute per run.
+fn longest_first(units: &[Unit], known: &BTreeMap<String, f64>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    order.sort_by(|&a, &b| {
+        let time = |i: usize| known.get(&units[i].key()).copied().unwrap_or(f64::INFINITY);
+        time(b).total_cmp(&time(a))
+    });
+    order
+}
+
 /// Run every unit of the built executables once, recording its reach; `None` if any failed.
 #[allow(clippy::too_many_arguments)] // the baseline scenario's pieces, built by the caller
 fn run_baseline(
@@ -252,6 +265,7 @@ fn run_baseline(
     args: &TestArgs,
     n_workers: usize,
     executables: &[Executable],
+    durations_file: &Utf8Path,
     mut output: ScenarioOutput,
     mut outcome: ScenarioOutcome,
 ) -> Result<Option<Baseline>> {
@@ -269,7 +283,9 @@ fn run_baseline(
     let units = list_units(executables, packages, args, build_dir.path())?;
     output.message(&format!("{} test units", units.len()))?;
     let results: Mutex<Vec<Option<UnitBaseline>>> = Mutex::new(vec![None; units.len()]);
-    let queue = Mutex::new(units.iter().enumerate());
+    let known = crate::durations::load(durations_file);
+    let order = longest_first(&units, &known);
+    let queue = Mutex::new(order.into_iter().map(|i| (i, &units[i])));
     thread::scope(|scope| -> Result<()> {
         let workers = (0..n_workers.min(units.len()).max(1))
             .map(|_| {
@@ -354,6 +370,19 @@ fn run_baseline(
         durations.push(duration);
         reach.push(unit_reach);
     }
+    crate::durations::record(
+        durations_file,
+        units
+            .iter()
+            .zip(&durations)
+            .map(|(unit, duration)| (unit.key(), duration.as_secs_f64())),
+    );
+    let slowest = (0..units.len())
+        .sorted_by(|&a, &b| durations[b].cmp(&durations[a]))
+        .take(5)
+        .map(|i| format!("{} {:.1}s", units[i].key(), durations[i].as_secs_f64()))
+        .join(", ");
+    info!(%slowest, "slowest baseline tests (kvasir-test budget checks them)");
     outcome.add_phase_result(PhaseResult {
         phase: Phase::Test,
         // The sum, not the wall time: the classic fallback runs its tests in one cargo process.
@@ -804,6 +833,45 @@ not json
         assert!(!error(Some("E0283"), "type annotations needed").is_context_free());
         assert!(!error(Some("E0284"), "type annotations needed").is_context_free());
         assert!(!error(None, "expected expression").is_context_free());
+    }
+
+    #[test]
+    fn baseline_starts_unknown_then_longest_units() {
+        use crate::schema_runner::UnitKind;
+
+        let package = Arc::new(Package {
+            name: "p".to_owned(),
+            version: "0.1.0".to_owned(),
+            relative_dir: Utf8PathBuf::new(),
+            top_sources: Vec::new(),
+        });
+        let unit = |name: &str| Unit {
+            kind: UnitKind::Test {
+                executable: Utf8PathBuf::from("target/debug/deps/p-1234"),
+                target: "lib:p".to_owned(),
+                name: name.to_owned(),
+            },
+            package: Arc::clone(&package),
+            cwd: Utf8PathBuf::new(),
+        };
+        let units = [
+            unit("fast"),
+            unit("slow"),
+            unit("new"),
+            unit("medium"),
+            unit("fast2"),
+        ];
+        let known: BTreeMap<String, f64> = [
+            ("p/lib:p/fast", 0.1),
+            ("p/lib:p/slow", 90.0),
+            ("p/lib:p/medium", 5.0),
+            ("p/lib:p/fast2", 0.1),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        assert_eq!(longest_first(&units, &known), [2, 1, 3, 0, 4]);
+        assert_eq!(longest_first(&units, &BTreeMap::new()), [0, 1, 2, 3, 4]);
     }
 
     #[test]

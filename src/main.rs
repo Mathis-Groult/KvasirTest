@@ -12,6 +12,7 @@
 )]
 
 mod annotation;
+mod budget;
 mod build_dir;
 mod cargo;
 mod compare;
@@ -19,6 +20,7 @@ mod config;
 mod console;
 mod copy_tree;
 mod custom;
+mod durations;
 mod equivalent;
 mod excerpt;
 mod exit_code;
@@ -134,6 +136,9 @@ enum Cargo {
     /// Compare two mutation runs across a refactor.
     #[command(name = "compare", styles(clap_styles()))]
     Compare(compare::CompareArgs),
+    /// Check recorded test times against a budget.
+    #[command(name = "budget", styles(clap_styles()))]
+    Budget(budget::BudgetArgs),
 }
 
 #[derive(Debug, Default, ValueEnum, Clone, Copy, Eq, PartialEq)]
@@ -553,6 +558,12 @@ fn main() -> Result<ExitCode> {
         Ok(Cargo::Mutants(args)) => args,
         Ok(Cargo::Compare(compare_args)) => {
             return compare::run(&compare_args).or_else(|err| {
+                eprintln!("Error: {err:?}");
+                Ok(ExitCode::Software)
+            });
+        }
+        Ok(Cargo::Budget(budget_args)) => {
+            return budget::run(&budget_args).or_else(|err| {
                 eprintln!("Error: {err:?}");
                 Ok(ExitCode::Software)
             });
