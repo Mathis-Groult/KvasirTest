@@ -76,7 +76,9 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   `swap-args` (adjacent call arguments of the same shape: `v(t.x, t.y)` -> `v(t.y, t.x)`),
   `enum-variant` (`Shape::Tall` -> another `Shape::` variant the same file uses),
   `substitute-arg` (an argument -> another passed at the same position of the same call in the
-  same function: `set(W, width)` -> `set(W, height)`), or `all`.
+  same function: `set(W, width)` -> `set(W, height)`), `call-default` (a method call passed as
+  an argument -> `Default::default()`), `swap-calls` (exchange the last arguments of two
+  consecutive calls of one method on one receiver), or `all`.
   They are generated only where a runtime switch fits. A swap the compiler rejects inside its
   own variant is reported unviable at once, without a build of its own.
 - A MISSED line also prints the mutated source (`mutated: let x = (a && b || c) && d;`): the

@@ -486,6 +486,75 @@ impl DiscoveryVisitor<'_> {
         }
     }
 
+    /// `--extra-mutants call-default`: a method call passed as an argument -> `Default::default()`.
+    fn collect_call_defaults(
+        &mut self,
+        args: &syn::punctuated::Punctuated<Expr, syn::Token![,]>,
+        call: proc_macro2::Span,
+    ) {
+        if !self.extra_here(ExtraKind::CallDefault) {
+            return;
+        }
+        for arg in args.iter().filter(|a| extra::call_default_candidate(a)) {
+            self.collect_mutant_text(
+                arg.span().into(),
+                "Default::default()".to_owned(),
+                Genre::CallDefault,
+                Some(Site {
+                    kind: SiteKind::Expr,
+                    span: call.into(),
+                }),
+            );
+        }
+    }
+
+    /// `--extra-mutants swap-calls`: exchange the last arguments of two consecutive calls; the
+    /// switch holds the whole statement list.
+    fn collect_call_swaps(&mut self, block: &Block) {
+        if !self.extra_here(ExtraKind::SwapCalls) {
+            return;
+        }
+        let code = self.source_file.code.clone();
+        let piece = |start: proc_macro2::LineColumn, end: proc_macro2::LineColumn| {
+            Span {
+                start: start.into(),
+                end: end.into(),
+            }
+            .extract(&code)
+        };
+        let inside = Span {
+            start: block.brace_token.span.open().end().into(),
+            end: block.brace_token.span.close().start().into(),
+        };
+        for k in extra::swappable_calls(&block.stmts) {
+            let last = |s: &syn::Stmt| match s {
+                syn::Stmt::Expr(Expr::MethodCall(m), _) => m.args.last().map(Spanned::span),
+                _ => None,
+            };
+            let (Some(a), Some(b)) = (last(&block.stmts[k]), last(&block.stmts[k + 1])) else {
+                continue;
+            };
+            let replacement = format!(
+                "{}{}{}",
+                piece(b.start(), b.end()),
+                piece(a.end(), b.start()),
+                piece(a.start(), a.end())
+            );
+            self.collect_mutant_text(
+                Span {
+                    start: a.start().into(),
+                    end: b.end().into(),
+                },
+                replacement,
+                Genre::SwapCalls,
+                Some(Site {
+                    kind: SiteKind::Expr,
+                    span: inside,
+                }),
+            );
+        }
+    }
+
     /// [`Self::collect_mutant`] with the replacement already as text.
     fn collect_mutant_text(
         &mut self,
@@ -666,6 +735,11 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         syn::visit::visit_expr_path(self, i);
     }
 
+    fn visit_block(&mut self, i: &'ast Block) {
+        self.collect_call_swaps(i);
+        syn::visit::visit_block(self, i);
+    }
+
     fn visit_pat(&mut self, i: &'ast syn::Pat) {
         self.pat_depth += 1;
         syn::visit::visit_pat(self, i);
@@ -694,6 +768,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         self.collect_arg_swaps(&i.args, i.span());
         self.collect_arg_substitutions(extra::callee_name(&i.func), &i.args, i.span());
+        self.collect_call_defaults(&i.args, i.span());
         let callee = i.func.span().start();
         self.callees.insert((callee.line, callee.column));
         syn::visit::visit_expr_call(self, i);
@@ -710,6 +785,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         self.collect_arg_swaps(&i.args, i.span());
         self.collect_arg_substitutions(Some(i.method.to_string()), &i.args, i.span());
+        self.collect_call_defaults(&i.args, i.span());
         syn::visit::visit_expr_method_call(self, i);
     }
 

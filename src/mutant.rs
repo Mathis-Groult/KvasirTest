@@ -46,6 +46,10 @@ pub enum Genre {
     /// Replace a call argument with another one passed at the same position of the same
     /// function elsewhere in the file (`--extra-mutants`).
     SubstituteArg,
+    /// Replace a method call passed as an argument with `Default::default()` (`--extra-mutants`).
+    CallDefault,
+    /// Exchange the last arguments of two consecutive same-method calls (`--extra-mutants`).
+    SwapCalls,
     /// A hand-written textual edit from a `--custom-mutants` spec (added by `KvasirTest`).
     Custom,
 }
@@ -56,7 +60,11 @@ impl Genre {
     pub fn may_not_type_check(&self) -> bool {
         matches!(
             self,
-            Genre::SwapArgs | Genre::EnumVariant | Genre::SubstituteArg
+            Genre::SwapArgs
+                | Genre::EnumVariant
+                | Genre::SubstituteArg
+                | Genre::CallDefault
+                | Genre::SwapCalls
         )
     }
 }

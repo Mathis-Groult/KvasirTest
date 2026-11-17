@@ -34,6 +34,8 @@ pub enum ExtraKind {
     SwapArgs,
     EnumVariant,
     SubstituteArg,
+    CallDefault,
+    SwapCalls,
 }
 
 /// The extra kinds a run generates.
@@ -278,6 +280,46 @@ impl<'ast> syn::visit::Visit<'ast> for ArgCollector {
 /// The line a function item starts on (its key in [`ArgUses`]).
 pub fn fn_line(span: proc_macro2::Span) -> usize {
     span.start().line
+}
+
+/// Method calls whose result is passed straight to another call, and that are not plain
+/// conversions: replacing one with `Default::default()` (`VarInt(self.x.load(..))` ->
+/// `VarInt(Default::default())`) checks that the value matters.
+pub fn call_default_candidate(arg: &Expr) -> bool {
+    const CONVERSIONS: [&str; 9] = [
+        "clone",
+        "into",
+        "to_owned",
+        "to_string",
+        "as_ref",
+        "as_str",
+        "borrow",
+        "as_mut",
+        "iter",
+    ];
+    matches!(arg, Expr::MethodCall(m) if !CONVERSIONS.contains(&m.method.to_string().as_str()))
+}
+
+/// Consecutive call statements on the same receiver and method with the same number (>= 2) of
+/// arguments whose last arguments differ (`e.set(A, x); e.set(B, y);`): the index of the first
+/// of each pair, for swapping their last arguments.
+pub fn swappable_calls(stmts: &[syn::Stmt]) -> Vec<usize> {
+    let call = |s: &syn::Stmt| match s {
+        syn::Stmt::Expr(Expr::MethodCall(m), Some(_)) if m.args.len() >= 2 => Some(m.clone()),
+        _ => None,
+    };
+    (0..stmts.len().saturating_sub(1))
+        .filter(|&i| match (call(&stmts[i]), call(&stmts[i + 1])) {
+            (Some(a), Some(b)) => {
+                a.method == b.method
+                    && a.args.len() == b.args.len()
+                    && text(&a.receiver) == text(&b.receiver)
+                    && text(a.args.last().expect(">= 2 args"))
+                        != text(b.args.last().expect(">= 2 args"))
+            }
+            _ => false,
+        })
+        .collect()
 }
 
 /// Atomic orderings: a swap is invisible to single-threaded tests.
@@ -605,6 +647,38 @@ fn f(e: &E, width: f32, height: f32) {
                 "src/main.rs: replace self.bright with self.radius in f",
             ]
         );
+    }
+
+    #[test]
+    fn the_visitor_defaults_call_arguments_and_swaps_call_values() {
+        let code = r"
+fn f(e: &E, w: f32, h: f32) {
+    e.set(WIDTH, w);
+    e.set(HEIGHT, h);
+    e.put(VarInt(self.b.load(Relaxed)), self.n.clone());
+}
+";
+        let options = crate::Options::from_arg_strs([
+            "mutants",
+            "--extra-mutants",
+            "call-default,swap-calls",
+        ]);
+        let mutants: Vec<_> = crate::visit::mutate_source_str(code, &options)
+            .unwrap()
+            .into_iter()
+            .filter(|m| matches!(m.genre, crate::Genre::CallDefault | crate::Genre::SwapCalls))
+            .collect();
+        let names: Vec<String> = mutants.iter().map(|m| m.name(false)).collect();
+        assert_eq!(
+            names,
+            [
+                "src/main.rs: replace w); e.set(HEIGHT, h with h); e.set(HEIGHT, w in f",
+                "src/main.rs: replace self.b.load(Relaxed) with Default::default() in f",
+            ]
+        );
+        // The swap's switch holds the whole statement list.
+        let site = mutants[0].site.expect("site").span.extract(code);
+        assert!(site.contains("e.set(WIDTH, w);") && site.contains("e.put("));
     }
 
     #[test]
