@@ -133,9 +133,15 @@ pub fn test_mutants(
         None
     };
     let Some(baseline) = baseline else {
-        error!(
-            "the schema with no mutant active did not build or pass its tests, so no mutants were tested"
-        );
+        if compiled.exit.is_success() {
+            error!(
+                "the schema built, but with no mutant active its tests did not pass (see the FAILED lines above), so no mutants were tested"
+            );
+        } else {
+            error!(
+                "the schema with no mutant active did not build (see the build log), so no mutants were tested"
+            );
+        }
         drop(prepared);
         return lab
             .output_mutex
@@ -330,6 +336,17 @@ fn run_baseline(
         flaky.push(unit_flaky);
         if !exit.is_success() {
             output.message(&format!("FAILED in baseline: {} ({exit:?})", unit.label()))?;
+            if exit.is_timeout() {
+                // `--timeout` bounds every test run, the baseline's included.
+                error!(
+                    unit = unit.label(),
+                    ?duration,
+                    limit = ?options.test_timeout,
+                    "FAILED in baseline: timed out (--timeout also bounds each baseline test; leave it unset to derive per-test limits from the baseline)"
+                );
+            } else {
+                error!(unit = unit.label(), ?exit, ?duration, "FAILED in baseline");
+            }
             if status.is_success() || exit.is_timeout() {
                 status = exit;
             }
@@ -598,15 +615,19 @@ fn prepare<'a>(
         }
         let errors = parse_errors(&compiled.json, build_dir.path());
         let before = out.clone();
-        // A kind that may not type-check, rejected inside its own variant: unviable, as a classic
-        // build of the same text would be, without paying for that build.
+        // A mutant rejected inside its own variant is unviable, as a classic build of the same
+        // text would be, without paying for that build: always for the kinds that may not
+        // type-check, and for every kind when the error does not depend on the schema's `if`
+        // (see `CompileError::is_context_free`).
         for e in &errors {
             if let Some(region) = schemas.get(&e.file).and_then(|s| s.innermost(&e.range))
                 && region.kind == RegionKind::Variant
                 && let [id] = region.ids.as_slice()
             {
                 let i = *id as usize - 1;
-                if mutants[i].genre.may_not_type_check() && !out.contains(&i) {
+                if (mutants[i].genre.may_not_type_check() || e.is_context_free())
+                    && !out.contains(&i)
+                {
                     unviable.entry(i).or_default().push_str(&e.rendered);
                 }
             }
@@ -682,6 +703,28 @@ struct CompileError {
     range: std::ops::Range<usize>,
     /// The compiler's rendered message (empty if it gave none).
     rendered: String,
+    /// The error code, e.g. `E0308` (`None` if the compiler gave none).
+    code: Option<String>,
+    /// The one-line message, e.g. ``mismatched types``.
+    message: String,
+}
+
+impl CompileError {
+    /// Whether a classic build of the mutated text would fail the same way, when the error
+    /// lies inside one mutant's variant.
+    ///
+    /// The variant sits in `if G { variant } else ..`, so its expected type comes from the
+    /// same context as in a classic build, with two exceptions this rejects: a branch that does
+    /// not match an EARLIER branch's type (rustc's "`if` and `else` have incompatible types";
+    /// a classic build has no other branch), and inference failures, which another branch
+    /// may change. Errors without a code are not judged either.
+    fn is_context_free(&self) -> bool {
+        const INFERENCE: [&str; 3] = ["E0282", "E0283", "E0284"];
+        self.code
+            .as_deref()
+            .is_some_and(|code| !INFERENCE.contains(&code))
+            && !self.message.contains("have incompatible types")
+    }
 }
 
 /// Primary spans of error-level compiler messages, with paths relative to `root`.
@@ -692,6 +735,8 @@ fn parse_errors(json_lines: &str, root: &Utf8Path) -> Vec<CompileError> {
         .filter(|v| v["reason"] == "compiler-message" && v["message"]["level"] == "error")
         .flat_map(|v| {
             let rendered = v["message"]["rendered"].as_str().unwrap_or("").to_owned();
+            let code = v["message"]["code"]["code"].as_str().map(str::to_owned);
+            let message = v["message"]["message"].as_str().unwrap_or("").to_owned();
             v["message"]["spans"]
                 .as_array()
                 .cloned()
@@ -709,6 +754,8 @@ fn parse_errors(json_lines: &str, root: &Utf8Path) -> Vec<CompileError> {
                         file,
                         range: start..end,
                         rendered: rendered.clone(),
+                        code: code.clone(),
+                        message: message.clone(),
                     })
                 })
                 .collect_vec()
@@ -732,5 +779,39 @@ not json
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].file, Utf8PathBuf::from("src/a.rs"));
         assert_eq!(errors[0].range, 10..14);
+    }
+
+    #[test]
+    fn only_errors_independent_of_the_schema_if_are_context_free() {
+        let error = |code: Option<&str>, message: &str| CompileError {
+            file: Utf8PathBuf::from("src/a.rs"),
+            range: 0..1,
+            rendered: String::new(),
+            code: code.map(str::to_owned),
+            message: message.to_owned(),
+        };
+        assert!(error(Some("E0308"), "mismatched types").is_context_free());
+        assert!(error(Some("E0277"), "cannot add `f64` to `Vector3<f64>`").is_context_free());
+        assert!(
+            error(
+                Some("E0061"),
+                "this function takes 3 arguments but 0 were supplied"
+            )
+            .is_context_free()
+        );
+        assert!(!error(Some("E0308"), "`if` and `else` have incompatible types").is_context_free());
+        assert!(!error(Some("E0282"), "type annotations needed").is_context_free());
+        assert!(!error(Some("E0283"), "type annotations needed").is_context_free());
+        assert!(!error(Some("E0284"), "type annotations needed").is_context_free());
+        assert!(!error(None, "expected expression").is_context_free());
+    }
+
+    #[test]
+    fn errors_carry_their_code_and_message() {
+        let json = r#"{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","code":{"code":"E0308","explanation":""},"rendered":"r","spans":[{"file_name":"src/a.rs","byte_start":1,"byte_end":2,"is_primary":true}]}}"#;
+        let errors = parse_errors(json, Utf8Path::new("/tree"));
+        assert_eq!(errors[0].code.as_deref(), Some("E0308"));
+        assert_eq!(errors[0].message, "mismatched types");
+        assert!(errors[0].is_context_free());
     }
 }

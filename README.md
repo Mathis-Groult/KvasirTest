@@ -50,12 +50,21 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
 
 - All mutants of the run are written into a **schema** of each mutated file, compiled once.
   Mutants a runtime switch cannot hold (const contexts, let-chains, proc-macro and
-  build-dependency crates, type errors) are found up front or by the compiler and run the
-  classic way, one build each, so every mutant still gets a verdict.
+  build-dependency crates) are found up front or by the compiler and run the classic way, one
+  build each, so every mutant still gets a verdict. A mutant the compiler rejects inside its own
+  switched branch is reported unviable at once, without a build of its own, unless the error
+  could depend on the schema (a branch whose type differs from an earlier branch's, or type
+  annotations needed): those still get their classic build.
 - The baseline runs every test in its own process and records which mutants each test reaches.
   A mutant runs only its reaching tests, fastest first, and stops at the first failure; a mutant
   no test reaches is reported missed without running.
 - Mutants run in parallel: CPUs minus 2 by default (`--schema-jobs N`).
+- Each test run under a mutant is limited to its own baseline time x `--timeout-multiplier`
+  (default 5), at least `--minimum-test-timeout`. A fixed `--timeout` replaces that limit for
+  EVERY test run, the baseline's included: a baseline test slower than it fails the run, and
+  every mutant that loops runs for the whole of it. Prefer leaving it unset.
+- When the unmutated schema fails, the error says whether it did not build or which baseline
+  test failed (with its time, and the limit when it timed out).
 - `--classic` (or `KVASIR_TEST_CLASSIC=1`) gives cargo-mutants' one-build-per-mutant mode.
 - `--custom-mutants spec.toml` adds hand-written mutants to the same build, with the same reach
   selection and verdicts. Each is a textual edit; `old` must occur exactly once in the file:
@@ -82,7 +91,7 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   enabled kind, the plain arguments of `vec!`, the `format!`/`write!` family and the `assert!`
   family; format strings are left alone), or `all`.
   They are generated only where a runtime switch fits. A swap the compiler rejects inside its
-  own variant is reported unviable at once, without a build of its own.
+  own variant is reported unviable at once, whatever the error.
 - A MISSED line also prints the mutated source (`mutated: let x = (a && b || c) && d;`): the
   statement it sits in with the mutation applied and the mutated expression in parentheses, so the
   grouping the compiler sees is explicit. The same text is `mutated_source` in `outcomes.json`.
