@@ -735,6 +735,17 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         syn::visit::visit_expr_path(self, i);
     }
 
+    /// `--extra-mutants macro-args`: mutate the plain expression arguments of `vec!`, the
+    /// `format!` family and the `assert!` family with every enabled kind.
+    fn visit_macro(&mut self, i: &'ast syn::Macro) {
+        if self.extra_here(ExtraKind::MacroArgs) {
+            for arg in extra::macro_args(i) {
+                self.visit_expr(&arg);
+            }
+        }
+        syn::visit::visit_macro(self, i);
+    }
+
     fn visit_block(&mut self, i: &'ast Block) {
         self.collect_call_swaps(i);
         syn::visit::visit_block(self, i);

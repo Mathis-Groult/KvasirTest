@@ -78,7 +78,9 @@ Options, filters and output (`mutants.out/`) are those of cargo-mutants 27.1; se
   `substitute-arg` (an argument -> another passed at the same position of the same call in the
   same function: `set(W, width)` -> `set(W, height)`), `call-default` (a method call passed as
   an argument -> `Default::default()`), `swap-calls` (exchange the last arguments of two
-  consecutive calls of one method on one receiver), or `all`.
+  consecutive calls of one method on one receiver), `macro-args` (also mutate, with every
+  enabled kind, the plain arguments of `vec!`, the `format!`/`write!` family and the `assert!`
+  family; format strings are left alone), or `all`.
   They are generated only where a runtime switch fits. A swap the compiler rejects inside its
   own variant is reported unviable at once, without a build of its own.
 - A MISSED line also prints the mutated source (`mutated: let x = (a && b || c) && d;`): the

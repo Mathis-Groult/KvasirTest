@@ -36,6 +36,7 @@ pub enum ExtraKind {
     SubstituteArg,
     CallDefault,
     SwapCalls,
+    MacroArgs,
 }
 
 /// The extra kinds a run generates.
@@ -318,6 +319,41 @@ pub fn swappable_calls(stmts: &[syn::Stmt]) -> Vec<usize> {
                         != text(b.args.last().expect(">= 2 args"))
             }
             _ => false,
+        })
+        .collect()
+}
+
+/// The argument expressions of a macro call whose arguments are plain expressions (`vec![..]`,
+/// the `format!` family after the format string, `assert!` family), parsed from its tokens so
+/// they keep their source spans; empty for other macros or when the tokens do not parse.
+/// String literals are left out: a format string must stay a literal.
+pub fn macro_args(mac: &syn::Macro) -> Vec<Expr> {
+    use syn::parse::Parser;
+    let Some(name) = mac.path.segments.last().map(|s| s.ident.to_string()) else {
+        return Vec::new();
+    };
+    // Leading arguments that are not values (a `write!` destination is one, but rarely worth it).
+    let skip = match name.as_str() {
+        "vec" | "assert" | "assert_eq" | "assert_ne" | "debug_assert" | "debug_assert_eq"
+        | "debug_assert_ne" | "format" | "format_args" | "print" | "println" | "eprint"
+        | "eprintln" => 0,
+        "write" | "writeln" => 1,
+        _ => return Vec::new(),
+    };
+    let parser = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+    let Ok(args) = parser.parse2(mac.tokens.clone()) else {
+        return Vec::new();
+    };
+    args.into_iter()
+        .skip(skip)
+        .filter(|e| {
+            !matches!(
+                e,
+                Expr::Lit(syn::ExprLit {
+                    lit: Lit::Str(_),
+                    ..
+                })
+            )
         })
         .collect()
 }
@@ -679,6 +715,44 @@ fn f(e: &E, w: f32, h: f32) {
         // The swap's switch holds the whole statement list.
         let site = mutants[0].site.expect("site").span.extract(code);
         assert!(site.contains("e.set(WIDTH, w);") && site.contains("e.put("));
+    }
+
+    #[test]
+    fn macro_arguments_are_mutated_when_asked() {
+        let code = r#"
+fn f(a: u32, b: u32, out: &mut String) -> Vec<u32> {
+    let _ = writeln!(out, "{} {}", a + b, "lit");
+    println!("{a}");
+    vec![a * b, 3]
+}
+"#;
+        let names = |extra: &str| -> Vec<String> {
+            let mut args = vec!["mutants"];
+            if !extra.is_empty() {
+                args.extend(["--extra-mutants", extra]);
+            }
+            crate::visit::mutate_source_str(code, &crate::Options::from_arg_strs(args))
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.genre != crate::Genre::FnValue)
+                .map(|m| m.name(true))
+                .collect()
+        };
+        assert_eq!(names(""), Vec::<String>::new());
+        assert_eq!(
+            names("macro-args"),
+            [
+                "src/main.rs:3:38: replace + with - in f",
+                "src/main.rs:3:38: replace + with * in f",
+                "src/main.rs:5:12: replace * with + in f",
+                "src/main.rs:5:12: replace * with / in f",
+            ]
+        );
+        let with_literals = names("macro-args,literal");
+        assert!(
+            with_literals.contains(&"src/main.rs:5:17: replace 3 with 2 in f".to_owned()),
+            "{with_literals:?}"
+        );
     }
 
     #[test]
