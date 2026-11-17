@@ -71,6 +71,15 @@ pub fn test_mutants(
     let args = TestArgs::parse(&options.additional_cargo_test_args);
     let packages = test_packages(&lab.tests_for_mutant, workspace, mutants);
     let n_workers = schema_jobs(options);
+    if let Some(limit) = options.test_timeout {
+        // A fixed limit replaces the per-test one derived from the baseline: every looping mutant
+        // then runs for all of it (34 x 120 s made one engine run 15 min longer), and it also
+        // bounds each baseline test.
+        warn!(
+            ?limit,
+            "--timeout replaces the per-test limits derived from the baseline (each test's time x --timeout-multiplier, at least --minimum-test-timeout); every mutant that loops runs for the whole limit. Prefer leaving it unset"
+        );
+    }
     let label = build_dir.path();
     let mut output = lab
         .output_mutex
