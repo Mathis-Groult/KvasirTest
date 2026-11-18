@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::build_dir::BuildDir;
 use crate::console::Console;
+use crate::iterate_tests::{Plan, STATE_JSON as ITERATE_STATE, State, plan, tree_hashes};
 use crate::lab::{Lab, TestsForMutant, join_threads};
 use crate::options::Options;
 use crate::outcome::{LabOutcome, Phase, PhaseResult, ScenarioOutcome};
@@ -36,7 +37,7 @@ use crate::schema::{
     ACTIVE_MUTANT_VAR, REACH_FILE_VAR, RegionKind, Schema, SchemaMutant, parse_reach, render,
 };
 use crate::schema_runner::{
-    Compiled, Executable, TestArgs, Unit, build, list_units, parse_executables,
+    Compiled, Executable, TestArgs, Unit, UnitKind, build, list_units, parse_executables,
 };
 use crate::test_mode::FLAKY_RETRIES;
 use crate::timeouts::Timeouts;
@@ -94,6 +95,8 @@ pub fn test_mutants(
     console.scenario_phase_started(label, Phase::Build);
     let prepare_start = Instant::now();
     let compile_time = workspace.compile_time_packages();
+    // Before the schema is written into the tree: the state of the code as the user left it.
+    let iterate = IterateInputs::read(&lab, workspace, &packages, options)?;
     let (prepared, compiled) = prepare(&build_dir, mutants, &compile_time, &mut || {
         build(
             build_dir.path(),
@@ -164,6 +167,9 @@ pub fn test_mutants(
         elapsed = ?baseline_start.elapsed(),
         "baseline and reach recorded"
     );
+    let mut baseline = baseline;
+    baseline.narrow = iterate.finish(&lab, &baseline.units)?;
+    let baseline = baseline;
     console.start_testing_mutants(mutants.len());
 
     let mutants_start = Instant::now();
@@ -251,6 +257,102 @@ struct Baseline {
     /// Units that failed and then passed in the baseline: a failure under a mutant is retried.
     flaky: Vec<bool>,
     timeouts: Timeouts,
+    /// `--iterate`: which units a mutant the previous run missed must run again.
+    narrow: Option<(Plan, Vec<bool>)>,
+}
+
+/// What `--iterate` needs from before the schema is written: this run's state and the plan.
+struct IterateInputs {
+    state: State,
+    plan: Option<Plan>,
+}
+
+impl IterateInputs {
+    fn read(
+        lab: &Lab<'_>,
+        workspace: &Workspace,
+        packages: &[Arc<Package>],
+        options: &Options,
+    ) -> Result<IterateInputs> {
+        let root = workspace.root();
+        let state = State {
+            args: format!(
+                "{:?} {:?}",
+                options.additional_cargo_test_args,
+                packages.iter().map(|p| &p.name).collect_vec()
+            ),
+            tree: tree_hashes(root)?,
+            units: BTreeSet::new(),
+        };
+        let plan = if options.iterate {
+            let old_dir = lab
+                .output_mutex
+                .lock()
+                .expect("lock output_dir")
+                .path()
+                .with_file_name("mutants.out.old");
+            let old: Option<State> = std::fs::read_to_string(old_dir.join(ITERATE_STATE))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok());
+            let plan = match old {
+                None => Plan::Full(format!("{old_dir} holds no {ITERATE_STATE}")),
+                Some(old) => {
+                    let missed = std::fs::read_to_string(old_dir.join("missed.txt"))
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::to_owned)
+                        .collect();
+                    let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+                    plan(&old, missed, &state.args, &state.tree, &read)
+                }
+            };
+            match &plan {
+                Plan::Full(reason) => info!(
+                    reason,
+                    "iterate: mutants the previous run missed run every test that reaches them"
+                ),
+                Plan::Changed { test_files, .. } => info!(
+                    ?test_files,
+                    "iterate: only test code changed since the previous run, so mutants it missed run only the tests of these files and new tests"
+                ),
+            }
+            Some(plan)
+        } else {
+            None
+        };
+        Ok(IterateInputs { state, plan })
+    }
+
+    /// Record this run's state for the next `--iterate` run and decide per unit.
+    fn finish(self, lab: &Lab<'_>, units: &[Unit]) -> Result<Option<(Plan, Vec<bool>)>> {
+        let state = State {
+            units: units.iter().map(Unit::key).collect(),
+            ..self.state
+        };
+        let path = lab
+            .output_mutex
+            .lock()
+            .expect("lock output_dir")
+            .path()
+            .join(ITERATE_STATE);
+        std::fs::write(&path, serde_json::to_string(&state)?)
+            .with_context(|| format!("write {path}"))?;
+        Ok(self.plan.map(|plan| {
+            let rerun = units
+                .iter()
+                .map(|unit| match &unit.kind {
+                    UnitKind::Test { target, name, .. } => plan.reruns(
+                        &unit.key(),
+                        unit.package.relative_dir.as_str(),
+                        target,
+                        name,
+                    ),
+                    UnitKind::DocTests => true,
+                })
+                .collect();
+            (plan, rerun)
+        }))
+    }
 }
 
 /// The order to start units in: longest known first, units with no recorded time before them
@@ -414,6 +516,7 @@ fn run_baseline(
         durations,
         reach,
         flaky,
+        narrow: None,
     }))
 }
 
@@ -457,6 +560,14 @@ fn run_schema_mutant(
         })
         .collect_vec();
     selected.sort_by_key(|&i| baseline.durations[i]);
+    let reaching = selected.len();
+    let narrowed = match &baseline.narrow {
+        Some((plan, rerun)) if plan.was_missed(&mutant.name) => {
+            selected.retain(|&i| rerun[i]);
+            true
+        }
+        _ => false,
+    };
 
     let diff = mutant.diff(&mutant.mutated_code());
     let scenario = Scenario::Mutant(mutant);
@@ -467,10 +578,15 @@ fn run_schema_mutant(
         .start_scenario(&scenario)?;
     output.write_diff(&diff)?;
     output.message(&format!(
-        "schema mutant {id}: {} of {} tests reach it",
-        selected.len(),
+        "schema mutant {id}: {reaching} of {} tests reach it",
         baseline.units.len()
     ))?;
+    if narrowed {
+        output.message(&format!(
+            "missed by the previous run, which they all passed: only the {} of them that changed since run again",
+            selected.len()
+        ))?;
+    }
     console.scenario_started(label, &scenario, output.open_log_read()?);
     let mut outcome = ScenarioOutcome::new(&output, scenario.clone());
     console.scenario_phase_started(label, Phase::Test);
@@ -506,7 +622,7 @@ fn run_schema_mutant(
             break;
         }
     }
-    if selected.is_empty() {
+    if selected.is_empty() && !narrowed {
         output.message("no test reaches this mutant: missed without running")?;
     }
     outcome.add_phase_result(PhaseResult {
@@ -962,8 +1078,6 @@ not json
 
     #[test]
     fn baseline_starts_unknown_then_longest_units() {
-        use crate::schema_runner::UnitKind;
-
         let package = Arc::new(Package {
             name: "p".to_owned(),
             version: "0.1.0".to_owned(),

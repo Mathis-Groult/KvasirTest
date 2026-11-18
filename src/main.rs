@@ -30,6 +30,7 @@ mod fnvalue;
 mod glob;
 mod in_diff;
 mod interrupt;
+mod iterate_tests;
 mod lab;
 mod list;
 mod manifest;

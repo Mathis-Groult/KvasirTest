@@ -47,6 +47,10 @@ pub struct Options {
     /// Don't run the tests, just see if each mutant builds.
     pub check_only: bool,
 
+    /// `--iterate`: skip what the previous run caught; in schema mode, re-run a mutant it
+    /// missed only on the tests that changed since (see `iterate_tests`).
+    pub iterate: bool,
+
     /// Copy `.git` and other VCS directories to build directories.
     pub copy_vcs: bool,
 
@@ -354,6 +358,7 @@ impl Options {
                 .or(config.build_timeout_multiplier),
             cap_lints: args.cap_lints.unwrap_or(config.cap_lints),
             check_only: args.check,
+            iterate: args.iterate,
             colors: args.colors,
             copy_vcs: args.copy_vcs.or(config.copy_vcs).unwrap_or(false),
             emit_json: args.json,
