@@ -33,7 +33,7 @@ use crate::output::{OutputDir, ScenarioOutput};
 use crate::package::Package;
 use crate::process::Exit;
 use crate::schema::{
-    ACTIVE_MUTANT_VAR, REACH_FILE_VAR, RegionKind, SchemaMutant, parse_reach, render,
+    ACTIVE_MUTANT_VAR, REACH_FILE_VAR, RegionKind, Schema, SchemaMutant, parse_reach, render,
 };
 use crate::schema_runner::{
     Compiled, Executable, TestArgs, Unit, build, list_units, parse_executables,
@@ -295,6 +295,7 @@ fn run_baseline(
     let known = crate::durations::load(durations_file);
     let order = longest_first(&units, &known);
     let queue = Mutex::new(order.into_iter().map(|i| (i, &units[i])));
+    let wall_start = Instant::now();
     thread::scope(|scope| -> Result<()> {
         let workers = (0..n_workers.min(units.len()).max(1))
             .map(|_| {
@@ -345,6 +346,7 @@ fn run_baseline(
             .collect_vec();
         join_threads(workers)
     })?;
+    let wall = wall_start.elapsed();
     let results = results.into_inner().expect("results");
     let mut status = Exit::Success;
     let mut durations = Vec::with_capacity(units.len());
@@ -394,8 +396,10 @@ fn run_baseline(
     info!(%slowest, "slowest baseline tests (kvasir-test budget checks them)");
     outcome.add_phase_result(PhaseResult {
         phase: Phase::Test,
-        // The sum, not the wall time: the classic fallback runs its tests in one cargo process.
-        duration: durations.iter().sum(),
+        // Left-out mutants run their tests in one cargo process, whose harness runs tests in
+        // parallel like the workers here, so their timeout is derived from this run's wall
+        // time. The sum (5 x 473 s on the engine) let one looping mutant run for 40 minutes.
+        duration: classic_suite_time(args, wall, durations.iter().sum()),
         process_status: status,
         argv: vec!["kvasir-test".into(), format!("{} units", units.len())],
     });
@@ -411,6 +415,16 @@ fn run_baseline(
         reach,
         flaky,
     }))
+}
+
+/// What a classic `cargo test` of the same units should take: the baseline's wall time, or
+/// the sum of the unit times when the harness is told to run one test at a time.
+fn classic_suite_time(args: &TestArgs, wall: Duration, sum: Duration) -> Duration {
+    if args.harness.iter().any(|a| a.starts_with("--test-threads")) {
+        sum
+    } else {
+        wall.min(sum)
+    }
 }
 
 fn finish_baseline(lab: &Lab<'_>, label: &Utf8Path, outcome: &ScenarioOutcome) -> Result<()> {
@@ -657,8 +671,12 @@ fn prepare<'a>(
         // text would be, without paying for that build: always for the kinds that may not
         // type-check, and for every kind when the error does not depend on the schema's `if`
         // (see `CompileError::is_context_free`).
-        for e in &errors {
-            if let Some(region) = schemas.get(&e.file).and_then(|s| s.innermost(&e.range))
+        let mut explained = vec![false; errors.len()];
+        for (e, explained) in errors.iter().zip(&mut explained) {
+            let Some(schema) = schemas.get(&e.file) else {
+                continue;
+            };
+            if let Some(region) = schema.innermost(&e.range)
                 && region.kind == RegionKind::Variant
                 && let [id] = region.ids.as_slice()
             {
@@ -668,12 +686,22 @@ fn prepare<'a>(
                 {
                     unviable.entry(i).or_default().push_str(&e.rendered);
                 }
+            } else if let Some(id) = e.moved_in_variant(schema) {
+                *explained = true;
+                let i = id as usize - 1;
+                if !out.contains(&i) {
+                    unviable.entry(i).or_default().push_str(&e.rendered);
+                }
             }
         }
         out.extend(unviable.keys().copied());
+        // An error explained by a move in a variant says nothing about the sites around its
+        // primary span: blaming them would take innocent mutants out.
         let blamed: BTreeSet<usize> = errors
             .iter()
-            .filter_map(|e| schemas.get(&e.file).map(|s| s.blame(&e.range)))
+            .zip(&explained)
+            .filter(|(_, explained)| !**explained)
+            .filter_map(|(e, _)| schemas.get(&e.file).map(|s| s.blame(&e.range)))
             .flatten()
             .map(|&id| id as usize - 1)
             .collect();
@@ -682,7 +710,32 @@ fn prepare<'a>(
             errors = errors.len(),
             blamed = blamed.len()
         );
+        if blamed.is_subset(&out) && out.len() > before.len() {
+            // Only unviable mutants were found this round: build again without them.
+            continue;
+        }
         if blamed.is_empty() || blamed.is_subset(&before) {
+            // The innermost regions did not hold the cause (a moved value used later, an
+            // error the compiler reports at a use): take out the mutants of every region
+            // around any span of the errors before giving up on every mutant. Falling back to
+            // all of them made one engine batch build 320 mutants one by one (~19 h).
+            let around: BTreeSet<usize> = errors
+                .iter()
+                .filter_map(|e| schemas.get(&e.file).map(|s| e.around(s)))
+                .flatten()
+                .map(|id| id as usize - 1)
+                .filter(|i| !out.contains(i))
+                .collect();
+            if !around.is_empty() {
+                warn!(
+                    errors = errors.len(),
+                    first = ?errors.first(),
+                    count = around.len(),
+                    "schema errors not attributable to one mutant; the mutants around them go classic"
+                );
+                out.extend(around);
+                continue;
+            }
             // A hand-written edit can break code outside its site (a moved value used later):
             // take those out before giving up on every mutant.
             let custom: BTreeSet<usize> = (0..mutants.len())
@@ -745,9 +798,58 @@ struct CompileError {
     code: Option<String>,
     /// The one-line message, e.g. ``mismatched types``.
     message: String,
+    /// The error's other spans in the same file (e.g. where a value was moved or borrowed).
+    secondary: Vec<std::ops::Range<usize>>,
 }
 
+/// Borrow-checker errors: the primary span is the USE that fails, a secondary span the move
+/// or borrow that causes it, which may sit in another mutant's variant.
+const BORROW_CONFLICTS: [&str; 5] = ["E0382", "E0499", "E0502", "E0505", "E0506"];
+
 impl CompileError {
+    /// The mutant whose variant holds the move or borrow behind a borrow-checker error whose
+    /// failing use lies outside every variant.
+    ///
+    /// Such a use is in code that a classic build of that mutant also contains (original code,
+    /// or the original branch of another site), and the move or borrow there is unconditional,
+    /// so the classic build fails the same way: the mutant is unviable. The primary span alone
+    /// blamed the innocent sites around the use, one compile round each, then gave up on
+    /// every mutant (batch 31 of the engine: `drop(s1)` -> `drop(s2)` followed by `drop(s2)`).
+    fn moved_in_variant(&self, schema: &Schema) -> Option<u32> {
+        if !self
+            .code
+            .as_deref()
+            .is_some_and(|c| BORROW_CONFLICTS.contains(&c))
+            || schema
+                .innermost(&self.range)
+                .is_some_and(|r| r.kind == RegionKind::Variant)
+        {
+            return None;
+        }
+        let culprits: BTreeSet<u32> = self
+            .secondary
+            .iter()
+            .filter_map(|range| schema.innermost(range))
+            .filter(|r| r.kind == RegionKind::Variant)
+            .filter_map(|r| match r.ids.as_slice() {
+                [id] => Some(*id),
+                _ => None,
+            })
+            .collect();
+        match culprits.into_iter().collect_vec().as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Every mutant whose region contains any span of the error.
+    fn around(&self, schema: &Schema) -> BTreeSet<u32> {
+        std::iter::once(&self.range)
+            .chain(&self.secondary)
+            .flat_map(|range| schema.around(range))
+            .collect()
+    }
+
     /// Whether a classic build of the mutated text would fail the same way, when the error
     /// lies inside one mutant's variant.
     ///
@@ -775,26 +877,39 @@ fn parse_errors(json_lines: &str, root: &Utf8Path) -> Vec<CompileError> {
             let rendered = v["message"]["rendered"].as_str().unwrap_or("").to_owned();
             let code = v["message"]["code"]["code"].as_str().map(str::to_owned);
             let message = v["message"]["message"].as_str().unwrap_or("").to_owned();
-            v["message"]["spans"]
+            let spans = v["message"]["spans"]
                 .as_array()
                 .cloned()
-                .unwrap_or_default()
-                .into_iter()
+                .unwrap_or_default();
+            let located = |s: &serde_json::Value| -> Option<(Utf8PathBuf, std::ops::Range<usize>)> {
+                let name = Utf8PathBuf::from(s["file_name"].as_str()?);
+                let file = name
+                    .strip_prefix(root)
+                    .map_or(name.clone(), Utf8Path::to_owned);
+                let start = usize::try_from(s["byte_start"].as_u64()?).ok()?;
+                let end = usize::try_from(s["byte_end"].as_u64()?).ok()?;
+                Some((file, start..end))
+            };
+            let others = spans
+                .iter()
+                .filter(|s| s["is_primary"] != true)
+                .filter_map(located)
+                .collect_vec();
+            spans
+                .iter()
                 .filter(|s| s["is_primary"] == true)
-                .filter_map(|s| {
-                    let name = Utf8PathBuf::from(s["file_name"].as_str()?);
-                    let file = name
-                        .strip_prefix(root)
-                        .map_or(name.clone(), Utf8Path::to_owned);
-                    let start = usize::try_from(s["byte_start"].as_u64()?).ok()?;
-                    let end = usize::try_from(s["byte_end"].as_u64()?).ok()?;
-                    Some(CompileError {
-                        file,
-                        range: start..end,
-                        rendered: rendered.clone(),
-                        code: code.clone(),
-                        message: message.clone(),
-                    })
+                .filter_map(located)
+                .map(|(file, range)| CompileError {
+                    secondary: others
+                        .iter()
+                        .filter(|(f, _)| *f == file)
+                        .map(|(_, r)| r.clone())
+                        .collect(),
+                    file,
+                    range,
+                    rendered: rendered.clone(),
+                    code: code.clone(),
+                    message: message.clone(),
                 })
                 .collect_vec()
         })
@@ -827,6 +942,7 @@ not json
             rendered: String::new(),
             code: code.map(str::to_owned),
             message: message.to_owned(),
+            secondary: Vec::new(),
         };
         assert!(error(Some("E0308"), "mismatched types").is_context_free());
         assert!(error(Some("E0277"), "cannot add `f64` to `Vector3<f64>`").is_context_free());
@@ -881,6 +997,80 @@ not json
         .collect();
         assert_eq!(longest_first(&units, &known), [2, 1, 3, 0, 4]);
         assert_eq!(longest_first(&units, &BTreeMap::new()), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn classic_timeout_follows_the_wall_time_unless_tests_run_one_at_a_time() {
+        let (wall, sum) = (Duration::from_secs(150), Duration::from_secs(470));
+        let args = |a: &[&str]| TestArgs::parse(&a.iter().map(|s| (*s).to_owned()).collect_vec());
+        assert_eq!(classic_suite_time(&args(&["--lib"]), wall, sum), wall);
+        assert_eq!(
+            classic_suite_time(&args(&["--", "--test-threads=1"]), wall, sum),
+            sum
+        );
+        assert_eq!(
+            classic_suite_time(&args(&["--", "--test-threads", "1"]), wall, sum),
+            sum
+        );
+        let short = Duration::from_secs(1);
+        assert_eq!(classic_suite_time(&args(&[]), wall, short), short);
+    }
+
+    #[test]
+    fn a_move_in_one_variant_makes_that_mutant_unviable_not_its_neighbours() {
+        use crate::schema::Region;
+        let schema = Schema {
+            code: String::new(),
+            regions: vec![
+                Region {
+                    kind: RegionKind::Site,
+                    range: 0..10,
+                    ids: vec![1],
+                },
+                Region {
+                    kind: RegionKind::Variant,
+                    range: 2..4,
+                    ids: vec![1],
+                },
+                Region {
+                    kind: RegionKind::Site,
+                    range: 20..30,
+                    ids: vec![2],
+                },
+            ],
+            rejected: Vec::new(),
+        };
+        let error = |code: &str, range, moved: std::ops::Range<usize>| CompileError {
+            file: Utf8PathBuf::from("src/a.rs"),
+            range,
+            rendered: String::new(),
+            code: Some(code.to_owned()),
+            message: "use of moved value".to_owned(),
+            secondary: vec![moved],
+        };
+        // Used at 22 (inside site 2's original code), moved at 2..3 inside mutant 1's variant.
+        assert_eq!(
+            error("E0382", 22..24, 2..3).moved_in_variant(&schema),
+            Some(1)
+        );
+        // Not a borrow-checker error, or the use itself is in a variant: not judged here.
+        assert_eq!(error("E0308", 22..24, 2..3).moved_in_variant(&schema), None);
+        assert_eq!(error("E0382", 2..3, 22..23).moved_in_variant(&schema), None);
+        // The move is in original code: no culprit.
+        assert_eq!(error("E0382", 22..24, 5..6).moved_in_variant(&schema), None);
+        assert_eq!(
+            error("E0382", 22..24, 5..6).around(&schema),
+            BTreeSet::from([1, 2])
+        );
+    }
+
+    #[test]
+    fn errors_keep_their_secondary_spans_in_the_same_file() {
+        let json = r#"{"reason":"compiler-message","message":{"level":"error","message":"use of moved value","code":{"code":"E0382"},"rendered":"r","spans":[{"file_name":"src/a.rs","byte_start":30,"byte_end":32,"is_primary":true},{"file_name":"src/a.rs","byte_start":5,"byte_end":7,"is_primary":false},{"file_name":"src/b.rs","byte_start":1,"byte_end":2,"is_primary":false}]}}"#;
+        let errors = parse_errors(json, Utf8Path::new("/tree"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].secondary.len(), 1);
+        assert_eq!(errors[0].secondary[0], 5..7);
     }
 
     #[test]

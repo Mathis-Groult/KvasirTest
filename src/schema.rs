@@ -7,7 +7,7 @@
 //! sits in) and returns the schema text plus [`Region`]s that map schema byte ranges back to mutant
 //! ids, so a compiler error can be blamed on the mutants that caused it ([`Schema::blame`]).
 
-use std::ops::Range;
+use std::{collections::BTreeSet, ops::Range};
 
 use serde::Serialize;
 
@@ -91,10 +91,22 @@ impl Schema {
 
     /// The innermost region containing `range`, if any.
     pub fn innermost(&self, range: &Range<usize>) -> Option<&Region> {
+        self.enclosing(range).min_by_key(|r| r.range.len())
+    }
+
+    /// Every mutant of every region containing `range`, innermost or not: the widest set
+    /// that an error at `range` can come from short of the whole schema.
+    pub fn around(&self, range: &Range<usize>) -> BTreeSet<u32> {
+        self.enclosing(range)
+            .flat_map(|r| r.ids.iter().copied())
+            .collect()
+    }
+
+    fn enclosing(&self, range: &Range<usize>) -> impl Iterator<Item = &Region> {
+        let (start, end) = (range.start, range.end);
         self.regions
             .iter()
-            .filter(|r| r.range.start <= range.start && range.end <= r.range.end)
-            .min_by_key(|r| r.range.len())
+            .filter(move |r| r.range.start <= start && end <= r.range.end)
     }
 }
 
@@ -601,6 +613,22 @@ mod test {
         let original = schema.code.rfind("a + b").unwrap();
         assert_eq!(schema.blame(&(original..original + 5)), &[1, 2]);
         assert_eq!(schema.blame(&(0..2)), &[] as &[u32]);
+    }
+
+    #[test]
+    fn around_takes_every_enclosing_region() {
+        let code = "fn f(a: u32, b: u32) -> u32 { a + b }\n";
+        let mutants = [
+            expr_mutant(code, 1, "+", "a + b", "-"),
+            expr_mutant(code, 2, "+", "a + b", "*"),
+        ];
+        let schema = render(code, &mutants).unwrap();
+        let variant_2 = schema.code.find("a * b").unwrap();
+        assert_eq!(
+            schema.around(&(variant_2..variant_2 + 1)),
+            BTreeSet::from([1, 2])
+        );
+        assert!(schema.around(&(0..2)).is_empty());
     }
 
     #[test]
