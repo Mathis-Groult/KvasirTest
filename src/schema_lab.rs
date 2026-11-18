@@ -26,7 +26,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::build_dir::BuildDir;
 use crate::console::Console;
-use crate::iterate_tests::{Plan, STATE_JSON as ITERATE_STATE, State, plan, tree_hashes};
+use crate::iterate_tests::{
+    Plan, Reuse, STATE_JSON as ITERATE_STATE, State, UnitRun, plan, tree_hashes,
+};
 use crate::lab::{Lab, TestsForMutant, join_threads};
 use crate::options::Options;
 use crate::outcome::{LabOutcome, Phase, PhaseResult, ScenarioOutcome};
@@ -130,6 +132,7 @@ pub fn test_mutants(
         } else {
             parse_executables(&compiled.json)
         };
+        let reuse = iterate.reuse(&prepared.active);
         run_baseline(
             &lab,
             &build_dir,
@@ -140,6 +143,7 @@ pub fn test_mutants(
             &crate::durations::path(workspace.target_directory()),
             output,
             outcome,
+            reuse.as_ref().map(|r| (r, &iterate)),
         )?
     } else {
         finish_baseline(&lab, label, &outcome)?;
@@ -168,7 +172,7 @@ pub fn test_mutants(
         "baseline and reach recorded"
     );
     let mut baseline = baseline;
-    baseline.narrow = iterate.finish(&lab, &baseline.units)?;
+    baseline.narrow = iterate.finish(&lab, &baseline, &prepared.active)?;
     let baseline = baseline;
     console.start_testing_mutants(mutants.len());
 
@@ -259,12 +263,15 @@ struct Baseline {
     timeouts: Timeouts,
     /// `--iterate`: which units a mutant the previous run missed must run again.
     narrow: Option<(Plan, Vec<bool>)>,
+    /// Wall time of the units' run (kept for the next `--iterate` run).
+    wall: Duration,
 }
 
 /// What `--iterate` needs from before the schema is written: this run's state and the plan.
 struct IterateInputs {
     state: State,
     plan: Option<Plan>,
+    old: Option<State>,
 }
 
 impl IterateInputs {
@@ -282,9 +289,9 @@ impl IterateInputs {
                 packages.iter().map(|p| &p.name).collect_vec()
             ),
             tree: tree_hashes(root)?,
-            units: BTreeSet::new(),
+            ..State::default()
         };
-        let plan = if options.iterate {
+        let plan: (Option<Plan>, Option<State>) = if options.iterate {
             let old_dir = lab
                 .output_mutex
                 .lock()
@@ -294,7 +301,7 @@ impl IterateInputs {
             let old: Option<State> = std::fs::read_to_string(old_dir.join(ITERATE_STATE))
                 .ok()
                 .and_then(|t| serde_json::from_str(&t).ok());
-            let plan = match old {
+            let plan = match &old {
                 None => Plan::Full(format!("{old_dir} holds no {ITERATE_STATE}")),
                 Some(old) => {
                     let missed = std::fs::read_to_string(old_dir.join("missed.txt"))
@@ -303,7 +310,7 @@ impl IterateInputs {
                         .map(str::to_owned)
                         .collect();
                     let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
-                    plan(&old, missed, &state.args, &state.tree, &read)
+                    plan(old, missed, &state.args, &state.tree, &read)
                 }
             };
             match &plan {
@@ -316,17 +323,68 @@ impl IterateInputs {
                     "iterate: only test code changed since the previous run, so mutants it missed run only the tests of these files and new tests"
                 ),
             }
-            Some(plan)
+            (Some(plan), old)
         } else {
-            None
+            (None, None)
         };
-        Ok(IterateInputs { state, plan })
+        let (plan, old) = plan;
+        Ok(IterateInputs { state, plan, old })
+    }
+
+    /// The previous baseline this run may reuse for unchanged units.
+    fn reuse(&self, active: &[(u32, Mutant)]) -> Option<Reuse> {
+        let names = active
+            .iter()
+            .map(|(id, m)| (*id, m.name.clone()))
+            .collect_vec();
+        Reuse::new(self.plan.as_ref()?, self.old.as_ref()?, &names)
+    }
+
+    /// Whether a unit changed since the previous run (always, without a narrowing plan).
+    fn reruns(&self, unit: &Unit) -> bool {
+        match (&self.plan, &unit.kind) {
+            (Some(plan), UnitKind::Test { target, name, .. }) => plan.reruns(
+                &unit.key(),
+                unit.package.relative_dir.as_str(),
+                target,
+                name,
+            ),
+            _ => true,
+        }
     }
 
     /// Record this run's state for the next `--iterate` run and decide per unit.
-    fn finish(self, lab: &Lab<'_>, units: &[Unit]) -> Result<Option<(Plan, Vec<bool>)>> {
+    fn finish(
+        self,
+        lab: &Lab<'_>,
+        baseline: &Baseline,
+        active: &[(u32, Mutant)],
+    ) -> Result<Option<(Plan, Vec<bool>)>> {
+        let units = &baseline.units;
+        let index_of: BTreeMap<u32, u32> = active
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (*id, u32::try_from(i).unwrap_or(u32::MAX)))
+            .collect();
         let state = State {
             units: units.iter().map(Unit::key).collect(),
+            mutants: active.iter().map(|(_, m)| m.name.clone()).collect(),
+            unit_runs: units
+                .iter()
+                .enumerate()
+                .map(|(i, unit)| {
+                    let run = UnitRun {
+                        secs: baseline.durations[i].as_secs_f64(),
+                        reach: baseline.reach[i]
+                            .iter()
+                            .filter_map(|id| index_of.get(id).copied())
+                            .collect(),
+                        flaky: baseline.flaky[i],
+                    };
+                    (unit.key(), run)
+                })
+                .collect(),
+            wall_secs: baseline.wall.as_secs_f64(),
             ..self.state
         };
         let path = lab
@@ -379,6 +437,7 @@ fn run_baseline(
     durations_file: &Utf8Path,
     mut output: ScenarioOutput,
     mut outcome: ScenarioOutcome,
+    reuse: Option<(&Reuse, &IterateInputs)>,
 ) -> Result<Option<Baseline>> {
     let (options, console) = (lab.options, lab.console);
     let label = build_dir.path();
@@ -393,9 +452,29 @@ fn run_baseline(
     console.scenario_phase_started(label, Phase::Test);
     let units = list_units(executables, packages, args, build_dir.path())?;
     output.message(&format!("{} test units", units.len()))?;
-    let results: Mutex<Vec<Option<UnitBaseline>>> = Mutex::new(vec![None; units.len()]);
-    let known = crate::durations::load(durations_file);
-    let order = longest_first(&units, &known);
+    let mut reused = vec![None; units.len()];
+    if let Some((reuse, iterate)) = reuse {
+        for (i, unit) in units.iter().enumerate() {
+            if let Some((secs, reach, flaky)) = reuse.get(&unit.key(), iterate.reruns(unit)) {
+                reused[i] = Some((Exit::Success, Duration::from_secs_f64(secs), reach, flaky));
+            }
+        }
+        let n = reused.iter().filter(|r| r.is_some()).count();
+        info!(
+            reused = n,
+            run = units.len() - n,
+            "iterate: unchanged tests keep the previous baseline (same code, same reach)"
+        );
+        output.message(&format!(
+            "{n} unchanged units reuse the previous baseline; {} run",
+            units.len() - n
+        ))?;
+    }
+    let order = longest_first(&units, &crate::durations::load(durations_file))
+        .into_iter()
+        .filter(|&i| reused[i].is_none())
+        .collect_vec();
+    let results: Mutex<Vec<Option<UnitBaseline>>> = Mutex::new(reused);
     let queue = Mutex::new(order.into_iter().map(|i| (i, &units[i])));
     let wall_start = Instant::now();
     thread::scope(|scope| -> Result<()> {
@@ -448,7 +527,11 @@ fn run_baseline(
             .collect_vec();
         join_threads(workers)
     })?;
-    let wall = wall_start.elapsed();
+    // A partly reused baseline ran only a few units: keep the previous run's wall time, which
+    // left-out mutants' timeout and the next `--iterate` run rely on.
+    let wall = wall_start.elapsed().max(Duration::from_secs_f64(
+        reuse.map_or(0.0, |(r, _)| r.wall_secs),
+    ));
     let results = results.into_inner().expect("results");
     let mut status = Exit::Success;
     let mut durations = Vec::with_capacity(units.len());
@@ -517,6 +600,7 @@ fn run_baseline(
         reach,
         flaky,
         narrow: None,
+        wall,
     }))
 }
 

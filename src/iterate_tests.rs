@@ -28,7 +28,7 @@ use crate::probe::fnv64;
 pub const STATE_JSON: &str = "iterate-state.json";
 
 /// What a later `--iterate` run compares itself with.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     /// The test arguments, as one string: other arguments select other tests.
     pub args: String,
@@ -36,6 +36,73 @@ pub struct State {
     pub tree: BTreeMap<String, u64>,
     /// Keys of every test unit of the baseline.
     pub units: BTreeSet<String>,
+    /// Names of the mutants held by the schema, in switch-id order (id 1 first).
+    #[serde(default)]
+    pub mutants: Vec<String>,
+    /// Each unit's baseline: its time, the schema mutants it reached (indexes into `mutants`)
+    /// and whether it was flaky. A later `--iterate` run reuses it for unchanged units.
+    #[serde(default)]
+    pub unit_runs: BTreeMap<String, UnitRun>,
+    /// Wall time of the whole baseline, seconds: left-out mutants' timeout comes from it.
+    #[serde(default)]
+    pub wall_secs: f64,
+}
+
+/// One unit's recorded baseline.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnitRun {
+    pub secs: f64,
+    pub reach: Vec<u32>,
+    pub flaky: bool,
+}
+
+/// The previous baseline of units an `--iterate` run need not run again: unchanged tests on
+/// unchanged code pass again and evaluate the same guards, so their reach (mapped from the
+/// previous run's switch ids to this run's by mutant name) is the same.
+pub struct Reuse {
+    by_unit: BTreeMap<String, UnitRun>,
+    old_names: Vec<String>,
+    id_of: BTreeMap<String, u32>,
+    pub wall_secs: f64,
+}
+
+impl Reuse {
+    /// `None` unless the plan narrows and every mutant now in the schema had its reach
+    /// recorded by the previous run (a mutant new to the schema has no recorded reach).
+    pub fn new(plan: &Plan, old: &State, active: &[(u32, String)]) -> Option<Reuse> {
+        if !matches!(plan, Plan::Changed { .. }) || old.unit_runs.is_empty() {
+            return None;
+        }
+        let known: BTreeSet<&String> = old.mutants.iter().collect();
+        if !active.iter().all(|(_, name)| known.contains(name)) {
+            return None;
+        }
+        Some(Reuse {
+            by_unit: old.unit_runs.clone(),
+            old_names: old.mutants.clone(),
+            id_of: active
+                .iter()
+                .map(|(id, name)| (name.clone(), *id))
+                .collect(),
+            wall_secs: old.wall_secs,
+        })
+    }
+
+    /// The recorded run of an unchanged unit (`rerun` = the plan says it changed), with its
+    /// reach in this run's switch ids.
+    pub fn get(&self, key: &str, rerun: bool) -> Option<(f64, BTreeSet<u32>, bool)> {
+        if rerun {
+            return None;
+        }
+        let run = self.by_unit.get(key)?;
+        let reach = run
+            .reach
+            .iter()
+            .filter_map(|&i| self.old_names.get(i as usize))
+            .filter_map(|name| self.id_of.get(name).copied())
+            .collect();
+        Some((run.secs, reach, run.flaky))
+    }
 }
 
 /// Hash every file of the tree, skipping build output, mutation output and VCS directories.
@@ -381,6 +448,7 @@ mod test {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+            ..State::default()
         }
     }
 
@@ -507,6 +575,32 @@ mod test {
         let read = |p: &str| files.get(p).cloned();
         let plan = plan(&old, BTreeSet::new(), "--lib -- golden", &old.tree, &read);
         assert!(matches!(plan, Plan::Full(r) if r.contains("arguments")));
+    }
+
+    #[test]
+    fn reuse_maps_reach_by_name_and_needs_every_mutant_known() {
+        let mut old = state(&files());
+        old.mutants = vec!["a".into(), "b".into(), "c".into()];
+        old.unit_runs.insert(
+            "u".into(),
+            UnitRun {
+                secs: 2.0,
+                reach: vec![0, 2],
+                flaky: false,
+            },
+        );
+        let plan = plan_after(&[]);
+        // This run holds c (id 1) and a (id 2); b was caught last time and is gone.
+        let reuse = Reuse::new(&plan, &old, &[(1, "c".into()), (2, "a".into())]).unwrap();
+        assert_eq!(
+            reuse.get("u", false),
+            Some((2.0, BTreeSet::from([1, 2]), false))
+        );
+        assert_eq!(reuse.get("u", true), None);
+        assert_eq!(reuse.get("other", false), None);
+        // A mutant the previous schema did not hold: no reuse at all.
+        assert!(Reuse::new(&plan, &old, &[(1, "new".into())]).is_none());
+        assert!(Reuse::new(&Plan::Full(String::new()), &old, &[(1, "a".into())]).is_none());
     }
 
     #[test]
